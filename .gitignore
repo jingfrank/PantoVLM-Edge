@@ -1,0 +1,50 @@
+# Python Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Caches, logs and runtime events
+local_cache/
+events/
+*.stackdump
+*.log
+
+# Large model files and weights
+models/*
+!models/.gitkeep
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.engine
+*.tensorrt
+
+# Video test datasets & large media files
+弓网典型视频/
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Temporary files & screenshots
+截图*.png
+截图*.jpg
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# IDE & Editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/

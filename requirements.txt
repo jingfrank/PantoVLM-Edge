@@ -1,0 +1,6 @@
+ultralytics==8.4.98
+opencv-python-headless
+pyyaml
+numpy
+openpyxl
+Pillow
