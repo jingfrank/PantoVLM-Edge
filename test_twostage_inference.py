@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Qwen3-VL-4B 两阶段综合检测脚本 (test_twostage_inference.py)
-Stage 1: 火花/脏污分类 (短 Prompt)
-Stage 2: 悬挂异物定位 (与 grounding 脚本一致的纯净 Prompt)
-两阶段对同一帧图片分别提问，避免注意力丢失。
+Qwen3-VL-4B 统一两阶段综合检测脚本 (test_twostage_inference.py)
+Stage 1: 火花/脏污全局分类 (短 Prompt + JSON 规范)
+Stage 2 动态路由:
+  - dirt == 1: 极度脏污，跳过 Stage 2 防止误报画框
+  - spk == 1: 触发火花 <box> 框定位分支
+  - dirt == 0 & spk == 0: 触发悬挂异物 <point> 靶心点定位分支 (含金属部件反向约束)
 """
 
 import os
@@ -17,7 +19,7 @@ from PIL import Image
 
 
 def infer_one(model, processor, pil_img, prompt, max_tokens=128):
-    """对一张图片执行一次推断，返回原始文本输出。"""
+    """对一张图片执行一次推断，返回原始文本输出与延迟。"""
     messages = [
         {
             "role": "user",
@@ -48,7 +50,7 @@ def infer_one(model, processor, pil_img, prompt, max_tokens=128):
 
 def run_twostage_inference():
     print("=======================================================")
-    print("[Qwen3-VL-4B] 正在初始化【两阶段】综合检测脚本...")
+    print("[Qwen3-VL-4B] 正在初始化【统一两阶段动态路由】综合检测脚本...")
     print("=======================================================")
 
     model_path = "./models/Qwen3-VL-4B-Instruct"
@@ -56,7 +58,7 @@ def run_twostage_inference():
         {"name": "大火花测试",   "path": "./弓网典型视频/spark_1.mp4",   "skip_to": 1400},
         {"name": "极度脏污测试", "path": "./弓网典型视频/dirty_2.mp4",   "skip_to": 1000},
         {"name": "局部脏污测试", "path": "./弓网典型视频/dirty_1.mp4",   "skip_to": 1000},
-        {"name": "悬挂异物测试", "path": "./弓网典型视频/foreign_1.mp4", "skip_to": 13400},
+        {"name": "悬挂异物测试", "path": "./弓网典型视频/foreign_1.mp4", "skip_to": 800},
     ]
 
     if not torch.cuda.is_available():
@@ -87,15 +89,38 @@ def run_twostage_inference():
     os.makedirs(save_dir, exist_ok=True)
 
     # =============================================
-    # Stage 1 Prompt: 火花 & 脏污分类 (简短专注)
+    # Stage 1 Prompt: 火花 & 脏污全局分类
     # =============================================
     prompt_stage1 = (
         "你是受电弓故障诊断专家。请观察图像，判断：\n"
-        "1. 火花(spk)：有无刺眼强光或电弧？\n"
+        "1. 火花(spk)：有无刺眼强光或电弧放电？\n"
         "2. 脏污(dirt)：画面是否极度模糊、失焦、或被水滴/污泥遮挡？注意：不要推测模糊的原因！只要画面模糊到难以辨认受电弓细节，就必须判定为脏污(dirt=1)。\n"
         "请先给出一句话的推理分析(reasoning)，描述画面的清晰度，然后再输出JSON。\n"
         "示例 JSON:\n"
         "{\"reasoning\": \"画面整体极度模糊，无法看清受电弓细节，判定为脏污。\", \"spk\": 0, \"dirt\": 1}"
+    )
+
+    # =============================================
+    # Stage 2A Prompt: 火花 <box> 矩形框定位
+    # =============================================
+    prompt_stage2_spark = (
+        "你是一个受电弓和接触网故障诊断专家。\n"
+        "图像中发生了大火花或电弧放电。请仔细观察并找出火花的位置。\n"
+        "如果找到了火花，请输出一段描述，并在最后必须使用XML格式给出火花的坐标，"
+        "格式为：<box>x_min, y_min, x_max, y_max</box>。\n"
+        "如果没有找到，请直接回复 'Normal'。"
+    )
+
+    # =============================================
+    # Stage 2B Prompt: 悬挂异物 <point> 点定位 (含反向约束)
+    # =============================================
+    prompt_stage2_foreign = (
+        "你是一个视觉定位专家。\n"
+        "请仔细观察受电弓碳滑板（最上方的弧形横梁）及其附近的接触网区域。\n"
+        "如果发现任何不属于受电弓本体结构的附着物或悬挂物（如缠绕的塑料薄膜、编织袋碎片、棉纱线头等），"
+        "请指出该异物最核心的中心点位置，并在最后使用XML格式给出点坐标，格式为：<point>x, y</point>（坐标归一化在 0 到 1000 之间）。\n\n"
+        "【什么不是异物】受电弓本身的金属部件（弓角、线夹、螺栓、卡扣、铰接关节、弹簧座、集电靴接头等）绝不是异物！\n"
+        "如果画面中只有受电弓本体结构而没有外来异物，请直接回复 'Normal'。"
     )
 
     for video_info in videos_to_test:
@@ -130,7 +155,7 @@ def run_twostage_inference():
             height, width, _ = raw_frame.shape
             pil_img = Image.fromarray(cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB))
 
-            # ===== Stage 1: 火花 & 脏污 =====
+            # ===== Stage 1: 火花 & 脏污 全局分类 =====
             s1_text, s1_ms = infer_one(model, processor, pil_img, prompt_stage1, max_tokens=128)
 
             # 解析 Stage 1 JSON
@@ -147,94 +172,99 @@ def run_twostage_inference():
             # ===== 动态路由 Stage 2 =====
             s2_text, s2_ms = "", 0
             box_match = None
-            box_format = 0
+            point_match = None
 
             if dirt == 1:
-                # 画面脏污，跳过 Stage 2
+                # 分支 1：极度脏污短路保护，跳过 Stage 2
                 s2_text = "Skipped (Dirt detected)"
             elif spk == 1:
-                # 发生火花，让 Stage 2 框出火花
-                prompt_stage2 = (
-                    "你是一个受电弓和接触网故障诊断专家。\n"
-                    "图像中发生了大火花或电弧放电。请仔细观察并找出火花的位置。\n"
-                    "如果找到了火花，请输出一段描述，并在最后必须使用XML格式给出火花的坐标，"
-                    "格式为：<box>x_min, y_min, x_max, y_max</box>。\n"
-                    "如果没有找到，请直接回复 'Normal'。"
-                )
-                s2_text, s2_ms = infer_one(model, processor, pil_img, prompt_stage2, max_tokens=128)
-            else:
-                # 画面干净且无火花，执行悬挂异物检测
-                prompt_stage2 = (
-                    "你是一个受电弓和接触网故障诊断专家。"
-                    "接触网线路上可能会挂有非金属的悬挂异物（如塑料薄膜、编织袋、风筝线、树枝、鸟窝等）。\n"
-                    "请仔细寻找图像中的悬挂异物。\n"
-                    "如果找到了异物，请输出一段描述，并在最后使用XML格式给出异物的坐标，"
-                    "格式为：<box>x_min, y_min, x_max, y_max</box>。\n"
-                    "如果没有找到异物，请直接回复 'Normal'。"
-                )
-                s2_text, s2_ms = infer_one(model, processor, pil_img, prompt_stage2, max_tokens=128)
-
-            if s2_text and s2_text != "Skipped (Dirt detected)":
-                # 解析 Stage 2 box（兼容两种格式）
+                # 分支 2：大火花定位 (<box> 模式)
+                s2_text, s2_ms = infer_one(model, processor, pil_img, prompt_stage2_spark, max_tokens=128)
                 box_pattern1 = r'<box>\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*</box>'
                 box_pattern2 = r'\((\d+)\s*,\s*(\d+)\)\s*,?\s*\((\d+)\s*,\s*(\d+)\)'
                 box_match = re.search(box_pattern1, s2_text)
-                box_format = 1
                 if not box_match:
                     box_match = re.search(box_pattern2, s2_text)
-                    box_format = 2
+            else:
+                # 分支 3：悬挂异物点定位 (<point> 模式)
+                s2_text, s2_ms = infer_one(model, processor, pil_img, prompt_stage2_foreign, max_tokens=128)
+                point_pattern1 = r'<point>\s*(\d+)\s*,\s*(\d+)\s*</point>'
+                point_pattern2 = r'\((\d+)\s*,\s*(\d+)\)'
+                point_match = re.search(point_pattern1, s2_text)
+                if not point_match:
+                    point_match = re.search(point_pattern2, s2_text)
 
             total_ms = s1_ms + s2_ms
 
-            # 构造日志
+            # 构造控制台展示状态
             flags = []
             if spk == 1:
                 flags.append("🔥 大火花")
             if dirt == 1:
                 flags.append("🌫️ 脏污")
             if box_match and spk == 1:
-                flags.append("🎯 火花定位")
-            elif box_match and spk == 0:
-                flags.append("📦 悬挂异物")
+                flags.append("🎯 火花定位(Box)")
+            elif point_match and spk == 0 and dirt == 0:
+                flags.append("🎯 悬挂异物(Point)")
 
             status_str = " | ".join(flags) if flags else "✅ 正常"
             print(f"[F:{frame_idx:05d}] [{total_ms:5.0f}ms] {status_str}")
             print(f"  ├─ S1({s1_ms:4.0f}ms): {s1_reasoning}")
-            if box_match:
-                print(f"  └─ S2({s2_ms:4.0f}ms): {s2_text}")
-            else:
-                s2_short = s2_text[:80] if len(s2_text) > 80 else s2_text
-                print(f"  └─ S2({s2_ms:4.0f}ms): {s2_short}")
+            s2_short = s2_text[:80] if len(s2_text) > 80 else s2_text
+            print(f"  └─ S2({s2_ms:4.0f}ms): {s2_short}")
 
-            # 如果检出异物，坐标反归一化后画框保存
-            if box_match:
+            # ===== 图像结果绘制与保存 =====
+            draw_frame = raw_frame.copy()
+            should_save = False
+
+            # Case A: 绘制火花 <box>
+            if box_match and spk == 1:
                 raw_coords = list(map(int, box_match.groups()))
-                if box_format == 1:
-                    # <box>x_min, y_min, x_max, y_max</box>
+                if len(raw_coords) == 4:
                     nx1, ny1, nx2, ny2 = raw_coords
-                else:
-                    # (y_min,x_min),(y_max,x_max) — Qwen原生格式，x/y反转
-                    ny1, nx1, ny2, nx2 = raw_coords
+                    x1 = max(0, min(width, int(nx1 / 1000.0 * width)))
+                    y1 = max(0, min(height, int(ny1 / 1000.0 * height)))
+                    x2 = max(0, min(width, int(nx2 / 1000.0 * width)))
+                    y2 = max(0, min(height, int(ny2 / 1000.0 * height)))
+                    print(f"  📐 火花 Box 坐标: 归一化({nx1},{ny1},{nx2},{ny2}) → 像素({x1},{y1},{x2},{y2})")
 
-                # 从 [0, 1000] 归一化坐标映射到原图绝对像素坐标
-                x1 = int(nx1 / 1000.0 * width)
-                y1 = int(ny1 / 1000.0 * height)
-                x2 = int(nx2 / 1000.0 * width)
-                y2 = int(ny2 / 1000.0 * height)
+                    cv2.rectangle(draw_frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                    cv2.putText(
+                        draw_frame, "Spark",
+                        (x1, max(y1 - 10, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2,
+                    )
+                    should_save = True
 
-                # 确保坐标在图像范围内
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(width, x2), min(height, y2)
+            # Case B: 绘制悬挂异物 <point> 准星标尺
+            elif point_match and spk == 0 and dirt == 0:
+                nx, ny = map(int, point_match.groups())
+                px = max(0, min(width - 1, int(nx / 1000.0 * width)))
+                py = max(0, min(height - 1, int(ny / 1000.0 * height)))
+                print(f"  📐 异物 Point 坐标: 归一化({nx},{ny}) → 像素({px},{py})")
 
-                print(f"  📐 坐标映射: 归一化({nx1},{ny1},{nx2},{ny2}) → 像素({x1},{y1},{x2},{y2})")
-
-                draw_frame = raw_frame.copy()
-                cv2.rectangle(draw_frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                # 同心圆与十字准星
+                cv2.circle(draw_frame, (px, py), 15, (0, 0, 255), 3)
+                cv2.circle(draw_frame, (px, py), 4, (0, 0, 255), -1)
+                cv2.line(draw_frame, (px - 25, py), (px + 25, py), (0, 0, 255), 2)
+                cv2.line(draw_frame, (px, py - 25), (px, py + 25), (0, 0, 255), 2)
                 cv2.putText(
-                    draw_frame, "Spark" if spk == 1 else "Foreign Object",
-                    (x1, max(y1 - 10, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2,
+                    draw_frame, f"Foreign Object Point ({px},{py})",
+                    (max(px - 100, 10), max(py - 30, 30)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
                 )
+                should_save = True
+
+            # Case C: 脏污画框标记
+            elif dirt == 1:
+                cv2.putText(
+                    draw_frame, "WARNING: Dirt / Blur Detected",
+                    (50, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 3,
+                )
+                should_save = True
+
+            if should_save:
                 save_path = os.path.join(save_dir, f"{v_name}_f{frame_idx:05d}.jpg")
                 cv2.imwrite(save_path, draw_frame)
 
@@ -243,8 +273,8 @@ def run_twostage_inference():
         cap.release()
 
     print(f"\n{'=' * 55}")
-    print(f"[Qwen3-VL-4B] ✅ 两阶段综合检测验证完成！")
-    print(f"[Qwen3-VL-4B] 📁 异物检测图片保存至: {save_dir}")
+    print(f"[Qwen3-VL-4B] ✅ 统一两阶段动态路由检测完成！")
+    print(f"[Qwen3-VL-4B] 📁 异常检测图片保存至: {save_dir}")
 
 
 if __name__ == "__main__":
