@@ -91,10 +91,11 @@ def run_twostage_inference():
     # =============================================
     prompt_stage1 = (
         "你是受电弓故障诊断专家。请观察图像，判断：\n"
-        "1. 火花(spk)：受电弓与接触网之间有无刺眼强光或电弧？注意：火花光晕不是脏污。\n"
-        "2. 脏污(dirt)：画面有无泥水、油污或水渍遮挡？只要污渍明显干扰了对受电弓或接触网的观察，即算脏污。\n"
-        "请先写一句reasoning，再输出JSON。\n"
-        "{\"reasoning\": \"...\", \"spk\": 0, \"dirt\": 0}"
+        "1. 火花(spk)：有无刺眼强光或电弧？\n"
+        "2. 脏污(dirt)：画面是否极度模糊、失焦、或被水滴/污泥遮挡？注意：不要推测模糊的原因！只要画面模糊到难以辨认受电弓细节，就必须判定为脏污(dirt=1)。\n"
+        "请先给出一句话的推理分析(reasoning)，描述画面的清晰度，然后再输出JSON。\n"
+        "示例 JSON:\n"
+        "{\"reasoning\": \"画面整体极度模糊，无法看清受电弓细节，判定为脏污。\", \"spk\": 0, \"dirt\": 1}"
     )
 
     for video_info in videos_to_test:
@@ -143,29 +144,46 @@ def run_twostage_inference():
             dirt = s1_res.get("dirt", 0)
             s1_reasoning = s1_res.get("reasoning", "")
 
-            # ===== Stage 2: 悬挂异物定位 =====
-            # 保留 <box> 格式指令让模型输出可解析坐标，但不告知像素尺寸
-            # 模型会用原生 [0,1000] 归一化坐标输出，代码中做反归一化
-            prompt_stage2 = (
-                "你是一个受电弓和接触网故障诊断专家。"
-                "接触网线路上可能会挂有非金属的悬挂异物（如塑料薄膜、编织袋、风筝线、树枝、鸟窝等）。\n"
-                "请仔细寻找图像中的悬挂异物。\n"
-                "如果找到了异物，请输出一段描述，并在最后使用XML格式给出异物的坐标，"
-                "格式为：<box>x_min, y_min, x_max, y_max</box>。\n"
-                "如果没有找到异物，请直接回复 'Normal'。"
-            )
-            s2_text, s2_ms = infer_one(model, processor, pil_img, prompt_stage2, max_tokens=128)
+            # ===== 动态路由 Stage 2 =====
+            s2_text, s2_ms = "", 0
+            box_match = None
+            box_format = 0
 
-            # 解析 Stage 2 box（兼容两种格式）
-            # 格式1: <box>x_min, y_min, x_max, y_max</box>
-            box_pattern1 = r'<box>\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*</box>'
-            # 格式2: (y_min,x_min),(y_max,x_max) — Qwen原生格式，注意x/y顺序反转
-            box_pattern2 = r'\((\d+)\s*,\s*(\d+)\)\s*,?\s*\((\d+)\s*,\s*(\d+)\)'
-            box_match = re.search(box_pattern1, s2_text)
-            box_format = 1
-            if not box_match:
-                box_match = re.search(box_pattern2, s2_text)
-                box_format = 2
+            if dirt == 1:
+                # 画面脏污，跳过 Stage 2
+                s2_text = "Skipped (Dirt detected)"
+            elif spk == 1:
+                # 发生火花，让 Stage 2 框出火花
+                prompt_stage2 = (
+                    "你是一个受电弓和接触网故障诊断专家。\n"
+                    "图像中发生了大火花或电弧放电。请仔细观察并找出火花的位置。\n"
+                    "如果找到了火花，请输出一段描述，并在最后必须使用XML格式给出火花的坐标，"
+                    "格式为：<box>x_min, y_min, x_max, y_max</box>。\n"
+                    "如果没有找到，请直接回复 'Normal'。"
+                )
+                s2_text, s2_ms = infer_one(model, processor, pil_img, prompt_stage2, max_tokens=128)
+            else:
+                # 画面干净且无火花，执行悬挂异物检测
+                prompt_stage2 = (
+                    "你是一个受电弓和接触网故障诊断专家。"
+                    "接触网线路上可能会挂有非金属的悬挂异物（如塑料薄膜、编织袋、风筝线、树枝、鸟窝等）。\n"
+                    "请仔细寻找图像中的悬挂异物。\n"
+                    "如果找到了异物，请输出一段描述，并在最后使用XML格式给出异物的坐标，"
+                    "格式为：<box>x_min, y_min, x_max, y_max</box>。\n"
+                    "如果没有找到异物，请直接回复 'Normal'。"
+                )
+                s2_text, s2_ms = infer_one(model, processor, pil_img, prompt_stage2, max_tokens=128)
+
+            if s2_text and s2_text != "Skipped (Dirt detected)":
+                # 解析 Stage 2 box（兼容两种格式）
+                box_pattern1 = r'<box>\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*</box>'
+                box_pattern2 = r'\((\d+)\s*,\s*(\d+)\)\s*,?\s*\((\d+)\s*,\s*(\d+)\)'
+                box_match = re.search(box_pattern1, s2_text)
+                box_format = 1
+                if not box_match:
+                    box_match = re.search(box_pattern2, s2_text)
+                    box_format = 2
+
             total_ms = s1_ms + s2_ms
 
             # 构造日志
@@ -174,7 +192,9 @@ def run_twostage_inference():
                 flags.append("🔥 大火花")
             if dirt == 1:
                 flags.append("🌫️ 脏污")
-            if box_match:
+            if box_match and spk == 1:
+                flags.append("🎯 火花定位")
+            elif box_match and spk == 0:
                 flags.append("📦 悬挂异物")
 
             status_str = " | ".join(flags) if flags else "✅ 正常"
@@ -211,7 +231,7 @@ def run_twostage_inference():
                 draw_frame = raw_frame.copy()
                 cv2.rectangle(draw_frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
                 cv2.putText(
-                    draw_frame, "Foreign Object",
+                    draw_frame, "Spark" if spk == 1 else "Foreign Object",
                     (x1, max(y1 - 10, 0)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2,
                 )
