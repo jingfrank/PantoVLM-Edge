@@ -25,6 +25,7 @@ sys.path.insert(0, app_dir)
 sys.path.insert(0, src_dir)
 
 from ai_detector import PantographFaultDetector
+from twostage_vlm_engine import TwoStageVLMEngine
 from phm_service import create_monitor_phm_reporter
 from ftp_uploader import init_ftp_uploader
 
@@ -76,8 +77,10 @@ def main():
     vs_cfg = global_cfg.get("video_stream_config", {})
     streams = vs_cfg.get("streams", [])
 
+    shared_vlm_engine = TwoStageVLMEngine(global_cfg.get("base_algorithm_config", {}))
+
     for stream_cfg in streams:
-        detector = PantographFaultDetector(global_cfg, stream_cfg, udp_sock, stop_event)
+        detector = PantographFaultDetector(global_cfg, stream_cfg, udp_sock, stop_event, vlm_engine=shared_vlm_engine)
         detectors.append(detector)
         t = threading.Thread(
             target=detector.run,

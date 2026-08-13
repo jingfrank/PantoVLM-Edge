@@ -19,7 +19,7 @@ def detect_platform():
 def get_gpu_memory_fraction(platform_id=None):
     """根据平台返回合适的 GPU 显存配额。"""
     pid = platform_id or detect_platform()
-    return 0.50 if pid == "orin" else 0.35
+    return 0.50 if pid == "orin" else 0.50
 
 def get_trt_engine_suffix():
     """返回当前平台的 TRT 引擎文件后缀。"""

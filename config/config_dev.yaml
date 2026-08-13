@@ -8,7 +8,7 @@ hardware_config:
 
 video_stream_config:
   streams:
-    - rtsp_url: "rtsp://192.168.106.200/live/test"
+    - rtsp_url: "./弓网典型视频/spark_1.mp4"
       camera_id: 0
       car_number: 6
       result_base_dir: "./local_cache/Algo-result"
