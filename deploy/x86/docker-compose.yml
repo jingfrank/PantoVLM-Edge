@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  gongwang_monitor:
+    build:
+      context: ../../
+      dockerfile: deploy/x86/Dockerfile
+    container_name: gongwang_dev
+    runtime: nvidia
+    network_mode: "host"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TZ=Asia/Shanghai
+    volumes:
+      - /mnt/T4/jyb/gongwang:/app
+    command: python main.py

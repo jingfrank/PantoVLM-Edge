@@ -1,0 +1,10 @@
+# Jetson AGX Orin ARM64 依赖
+# ⚠️ 不要 pip install torch！使用 L4T 容器预装的 PyTorch
+ultralytics==8.4.98 --no-deps
+opencv-python-headless
+pyyaml
+numpy
+openpyxl
+Pillow
+transformers>=4.57.0
+accelerate

@@ -1,0 +1,8 @@
+# Titan RTX x86_64 标准 PyPI 依赖
+opencv-python-headless
+pyyaml
+numpy
+openpyxl
+Pillow
+transformers>=4.57.0
+accelerate

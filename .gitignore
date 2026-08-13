@@ -10,6 +10,9 @@ events/
 *.stackdump
 *.log
 
+# Bundle files
+*.bundle
+
 # Large model files and weights
 models/*
 !models/.gitkeep
@@ -23,6 +26,7 @@ models/*
 
 # Video test datasets & large media files
 弓网典型视频/
+视频/
 *.mp4
 *.avi
 *.mkv
