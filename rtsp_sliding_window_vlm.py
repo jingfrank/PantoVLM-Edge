@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-基于 Qwen3-VL 的 RTSP 视频流时序滑动窗口故障检测系统 (集成 Visual Grounding 视觉定位)
+基于 Qwen3-VL 的 RTSP 视频流时序滑动窗口故障检测系统 (集成 Visual Grounding 点定位 Point)
 (rtsp_sliding_window_vlm.py)
 
 设计规格：
@@ -11,13 +11,13 @@
 4. 多帧时序分析与视觉定位：
    - 【大火花 (spark)】：受电弓碳滑板与接触网间剧烈燃弧、拉弧放电分析
    - 【悬挂异物 (foreign_object)】：
-     * 引入 Visual Grounding 视觉定位约束，强制要求输出异物中心点坐标 <point>x, y</point> (0-1000 归一化)
-     * 注入负向排除规则 (Negative Prompting)：排除弓角、线夹、螺栓、绝缘子等正常金属构件
-     * 幻觉过滤：未定位到坐标时不予告警，杜绝模型幻觉误报
+     * 引入 Visual Grounding 中心点定位约束：<point>x, y</point> (0-1000 归一化)
+     * if foreign object does not exist in a frame, skip that frame
+     * 幻觉过滤：未定位到目标中心点时不予告警，杜绝模型幻觉误报
    - 【镜头脏污 (dirt)】：镜头表面水滴、油膜、泥斑遮挡或严重污损
 5. 架构特性：
    - 多线程解耦：独立后台拉流线程持续清空 RTSP 缓冲，杜绝视频流时延堆积
-   - 结构化 JSON 约束输出 + 坐标点自动提取与图像可视化标定
+   - 结构化 JSON 约束输出 + 目标点自动提取与图像可视化标定
 """
 
 import os
@@ -43,15 +43,15 @@ DEFAULT_MODEL_PATH = "./models/Qwen3-VL-4B-Instruct"
 WINDOW_SIZE = 4  # 窗口大小：4 帧
 SAMPLE_INTERVAL = 1.0  # 采样间隔：1 秒 / 帧 (1 FPS)
 
-# 专为 3 项故障定制的 Visual Grounding 时序分析 Prompt
+# 专为 3 项故障定制的 Visual Grounding 时序分析 Prompt (Point 点定位)
 TEMPORAL_FAULT_PROMPT = (
-    "你是一个顶级的受电弓与接触网故障诊断与视觉定位专家。\n"
+    "这是动车列车车顶摄像头拍摄的受电弓视频图像\n"
     "输入是由连续4秒（每秒1帧，共4帧）构成的时序视频片段。请仔细排查以下3类故障：\n\n"
     "1. 【大火花 (spark)】：判断受电弓碳滑板与上方接触网导线接触点是否存在明显的燃弧、大火花放电（注意区分正常金属反光与真实火花放电）。(0/1)\n"
     "2. 【镜头脏污 (dirt)】：判断摄像机镜头表面是否有明显的水渍、污泥、油斑遮挡或严重污损模糊。(0/1)\n"
-    "3. 【悬挂异物 (foreign_object)】：仔细观察受电弓碳滑板、弓角及接触网上是否有非金属悬挂物（塑料薄膜、编织袋、风筝线、鸟巢、树枝等）。\n"
-    "   若确认发现外来异物，detect and localize the visual content output format：<point>x, y</point>（x, y 范围在 0 到 1000 之间）；若没有外来异物，foreign_point 必须填 null。\n\n"
-    "if foreign object does not exist in a frame, skip that frame"
+    "3. 【悬挂异物 (foreign_object)】：受电弓碳滑板上高度怀疑有附着异物（塑料薄膜、编织袋、风筝线、鸟巢、树枝等）。\n"
+    "detect and localize the visual content output format：<point>x, y</point>（x, y 坐标均在 0 到 1000 之间）；若没有外来异物，foreign_point 必须填 null。\n\n"
+    "if foreign object does not exist in a frame, skip that frame。\n"
     "请严格按以下 JSON 格式输出（请勿输出任何多余的前缀或Markdown格式）：\n"
     "{\n"
     '  "spark": 0,\n'
@@ -211,14 +211,16 @@ def infer_window_frame_list(
     model, processor, frames_bgr_list, prompt=TEMPORAL_FAULT_PROMPT, max_tokens=384
 ):
     """
-    将 4 帧 BGR 图像组装成 frame_list 喂入 Qwen3-VL 进行时序分析与视觉定位
+    将 4 帧 BGR 图像组装成 frame_list 喂入 Qwen3-VL 进行时序分析与视觉定位 (Point)
     """
-    # 转换为 PIL Image (RGB 格式)
     pil_frames = [
         Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_bgr_list
     ]
 
-    content = [{"type": "video", "video": pil_frames}, {"type": "text", "text": prompt}]
+    content = [
+        {"type": "video", "video": pil_frames, "fps": 1.0},
+        {"type": "text", "text": prompt},
+    ]
     messages = [{"role": "user", "content": content}]
 
     text = processor.apply_chat_template(
@@ -251,7 +253,6 @@ def infer_window_frame_list(
         elif "```" in clean_text:
             clean_text = clean_text.split("```")[1].split("```")[0].strip()
 
-        # 若大模型有前后多余文本，正则提取大括号内容
         json_match = re.search(r"\{[\s\S]*\}", clean_text)
         if json_match:
             parsed_json = json.loads(json_match.group(0))
@@ -270,15 +271,9 @@ def infer_window_frame_list(
             "summary": "解析失败",
         }
 
-    # ==================== 视觉定位坐标后处理与幻觉校验 ====================
-    # 检索是否输出了 <point>x, y</point> 坐标
+    # ==================== 视觉定位坐标后处理与幻觉校验 (Point) ====================
     search_target = str(parsed_json.get("foreign_point") or "") + " " + output_text
     point_match = re.search(r"<point>\s*(\d+)\s*,\s*(\d+)\s*</point>", search_target)
-
-    # 同时也兼顾 box 格式 <box>ymin, xmin, ymax, xmax</box> 或 <box>x1, y1, x2, y2</box>
-    box_match = re.search(
-        r"<box>\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*</box>", search_target
-    )
 
     if point_match:
         nx = int(point_match.group(1))
@@ -286,25 +281,24 @@ def infer_window_frame_list(
         parsed_json["foreign_object"] = 1
         parsed_json["foreign_point_coords"] = (nx, ny)
         parsed_json["foreign_point"] = f"<point>{nx}, {ny}</point>"
-    elif box_match:
-        coords = [int(box_match.group(i)) for i in range(1, 5)]
-        # 取 box 中心点作为定位点
-        cx = int((coords[0] + coords[2]) / 2)
-        cy = int((coords[1] + coords[3]) / 2)
-        parsed_json["foreign_object"] = 1
-        parsed_json["foreign_point_coords"] = (cx, cy)
-        parsed_json["foreign_point"] = (
-            f"<box>{coords[0]},{coords[1]},{coords[2]},{coords[3]}</box>"
-        )
     else:
-        # 核心幻觉抑制：如果模型回答了 foreign_object=1 但未能给出合法的定位坐标，自动降级为 0（判定为幻觉）
-        if parsed_json.get("foreign_object") == 1:
-            print(
-                "[Visual Grounding 拦截] ⚠️ 模型标记了异物但未给出有效坐标定位，判定为部件结构幻觉，已自动滤除。"
-            )
-            parsed_json["foreign_object"] = 0
-        parsed_json["foreign_point_coords"] = None
-        parsed_json["foreign_point"] = None
+        # 兼容括号 (x, y) 格式
+        paren_match = re.search(r"\((\d+)\s*,\s*(\d+)\)", search_target)
+        if paren_match:
+            nx = int(paren_match.group(1))
+            ny = int(paren_match.group(2))
+            parsed_json["foreign_object"] = 1
+            parsed_json["foreign_point_coords"] = (nx, ny)
+            parsed_json["foreign_point"] = f"<point>{nx}, {ny}</point>"
+        else:
+            # 核心幻觉抑制：如果模型回答了 foreign_object=1 但未能给出合法的定位点坐标，自动降级为 0
+            if parsed_json.get("foreign_object") == 1:
+                print(
+                    "[Visual Grounding 拦截] ⚠️ 模型标记了异物但未给出有效 <point> 坐标定位，判定为部件结构幻觉，已自动滤除。"
+                )
+                parsed_json["foreign_object"] = 0
+            parsed_json["foreign_point_coords"] = None
+            parsed_json["foreign_point"] = None
 
     return output_text, parsed_json, latency_ms
 
@@ -327,7 +321,7 @@ def run_sliding_window_detection(
     ).start()
 
     print(
-        "\n🚀 [系统就绪] 开始执行 4 帧滑动窗口时序监测 (集成 Visual Grounding 点定位)..."
+        "\n🚀 [系统就绪] 开始执行 4 帧滑动窗口时序监测 (集成 Visual Grounding Point 定位)..."
     )
     print(
         f"📌 监控目标: 1. 大火花(spark) | 2. 悬挂异物(foreign_object) | 3. 镜头脏污(dirt)"
@@ -360,7 +354,7 @@ def run_sliding_window_detection(
             if len(window_buffer) == WINDOW_SIZE:
                 window_count += 1
                 print(
-                    f"\n⚡ ===== [第 {window_count} 个时序窗口 (4秒跨度)] 送入 Qwen3-VL 进行多帧理解与视觉定位 ====="
+                    f"\n⚡ ===== [第 {window_count} 个时序窗口 (4秒跨度)] 送入 Qwen3-VL 进行多帧理解与视觉定位 (Point) ====="
                 )
 
                 raw_output, parsed_json, latency_ms = infer_window_frame_list(
@@ -380,7 +374,7 @@ def run_sliding_window_detection(
                 spk_tag = "🔴【发现大火花】" if spk else "🟢 无火花"
                 dirt_tag = "🟡【镜头脏污遮挡】" if dirt else "🟢 镜头清晰"
                 if obj and point_coords:
-                    obj_tag = f"🔴【发现异物悬挂】(定位坐标: X={point_coords[0]}, Y={point_coords[1]})"
+                    obj_tag = f"🔴【发现异物悬挂】(定位点 <point>: X={point_coords[0]}, Y={point_coords[1]})"
                 else:
                     obj_tag = "🟢 无异物"
 
@@ -408,11 +402,10 @@ def run_sliding_window_detection(
 
 
 def save_event_collage(frames, result_json, save_dir, event_id):
-    """当出现故障时，将 4 帧拼接并在图像上绘制异物中心点与告警信息"""
+    """当出现故障时，将 4 帧拼接并在图像上绘制异物中心点与十字准星"""
     annotated_frames = [f.copy() for f in frames]
     point_coords = result_json.get("foreign_point_coords")
 
-    # 如果定位到了异物点坐标 (0-1000 归一化)，在最后一帧（或所有帧）上绘制红色准心瞄准标记
     if point_coords is not None:
         nx, ny = point_coords
         for f in annotated_frames:
@@ -420,17 +413,18 @@ def save_event_collage(frames, result_json, save_dir, event_id):
             px = int(np.clip(nx / 1000.0 * w, 0, w - 1))
             py = int(np.clip(ny / 1000.0 * h, 0, h - 1))
 
-            # 绘制醒目的红色十字准心与目标外圈
-            cv2.circle(f, (px, py), 18, (0, 0, 255), 2)
+            # 绘制醒目的红色十字准星瞄准圈
+            cv2.circle(f, (px, py), 20, (0, 255, 255), 1)  # 黄色外圈
+            cv2.circle(f, (px, py), 14, (0, 0, 255), 2)  # 红色主圈
             cv2.circle(f, (px, py), 4, (0, 0, 255), -1)
-            cv2.line(f, (px - 28, py), (px + 28, py), (0, 0, 255), 2)
-            cv2.line(f, (px, py - 28), (px, py + 28), (0, 0, 255), 2)
+            cv2.line(f, (px - 26, py), (px + 26, py), (0, 0, 255), 2)
+            cv2.line(f, (px, py - 26), (px, py + 26), (0, 0, 255), 2)
             cv2.putText(
                 f,
-                f"FOREIGN OBJECT ({nx},{ny})",
-                (max(10, px - 60), max(25, py - 25)),
+                f"POINT ({nx},{ny})",
+                (max(10, px - 40), max(25, py - 25)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.55,
                 (0, 0, 255),
                 2,
                 cv2.LINE_AA,
@@ -464,13 +458,13 @@ def save_event_collage(frames, result_json, save_dir, event_id):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(result_json, f, ensure_ascii=False, indent=2)
 
-    print(f"  💾 🚨 故障事件（含视觉定位标定）已归档: {img_path}", flush=True)
+    print(f"  💾 🚨 故障事件（含中心点 <point> 标定）已归档: {img_path}", flush=True)
 
 
 # ==================== 入口函数 ====================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Qwen3-VL 4帧滑动窗口时序视频理解与视觉定位"
+        description="Qwen3-VL 4帧滑动窗口时序视频理解与视觉定位 (Point)"
     )
     parser.add_argument(
         "--source",
