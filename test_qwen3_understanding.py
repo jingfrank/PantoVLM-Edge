@@ -169,22 +169,14 @@ def run_video_mode(model, processor, args):
     else:
         print(f"测试模式: 【带 Prompt 模式】: {args.prompt[:60]}...", flush=True)
 
-    frames = []
-    curr_idx = 0
-    sample_set = set(sample_indices)
-    sample_frames_dict = {}
-
-    while cap.isOpened() and len(sample_frames_dict) < len(sample_set):
+    ordered_frames = []
+    for idx in sample_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ret, frame = cap.read()
-        if not ret or frame is None:
-            break
-        if curr_idx in sample_set:
-            sample_frames_dict[curr_idx] = frame
-        curr_idx += 1
-
+        if ret and frame is not None:
+            ordered_frames.append(frame)
     cap.release()
 
-    ordered_frames = [sample_frames_dict[i] for i in sample_indices if i in sample_frames_dict]
     if not ordered_frames:
         print("[错误] 未能成功抽取到视频帧", flush=True)
         return
@@ -205,17 +197,22 @@ def run_video_mode(model, processor, args):
     print(f"{output_text}", flush=True)
     print("=" * 70, flush=True)
 
-    # 保存报告与采样关键帧拼图
-    base_name = os.path.splitext(os.path.basename(args.video))[0]
-    txt_save_path = os.path.join(args.save_dir, f"{base_name}_video_understanding.txt")
+    # 保存报告与采样关键帧
+    txt_save_path = os.path.join(args.actual_save_dir, "whole_video_analysis_report.txt")
     with open(txt_save_path, "w", encoding="utf-8") as f:
         f.write(f"视频: {args.video}\n")
-        f.write(f"时长: {duration_sec:.1f}s, 帧数: {total_frames}, 采样帧数: {len(ordered_frames)}\n")
-        f.write(f"推理耗时: {latency_ms:.1f} ms\n")
-        f.write("=" * 50 + "\n")
+        f.write(f"时长: {duration_sec:.1f}s, 帧数: {total_frames}, 采样时序帧数: {len(ordered_frames)}\n")
+        f.write(f"采样帧索引: {sample_indices.tolist()}\n")
+        f.write(f"推理耗时: {latency_ms:.1f} ms ({latency_ms/1000:.2f}s)\n")
+        f.write("=" * 60 + "\n")
         f.write(f"Qwen3-VL 完整输出:\n{output_text}\n")
 
-    print(f"💾 分析报告已保存至: {txt_save_path}", flush=True)
+    # 保存抽取的关键时序帧图片便于对照
+    for idx_num, (orig_frame_idx, f_bgr) in enumerate(zip(sample_indices, ordered_frames)):
+        frame_pic_path = os.path.join(args.actual_save_dir, f"sample_seq_{idx_num+1}_frame_{orig_frame_idx:06d}.jpg")
+        cv2.imwrite(frame_pic_path, f_bgr)
+
+    print(f"💾 分析报告及采样关键帧已完整保存至独立目录: {os.path.abspath(args.actual_save_dir)}", flush=True)
 
 
 def run_stream_mode(model, processor, args):
@@ -268,16 +265,17 @@ def run_stream_mode(model, processor, args):
         print(f"🤖 Qwen3-VL 完整输出:\n{output_text}", flush=True)
         print("=" * 70 + "\n", flush=True)
 
-        # 保存结果
+        # 保存结果到视频独立目录
         base_name = f"frame_{frame_idx:06d}"
-        img_save_path = os.path.join(args.save_dir, f"{base_name}.jpg")
-        txt_save_path = os.path.join(args.save_dir, f"{base_name}_output.txt")
+        img_save_path = os.path.join(args.actual_save_dir, f"{base_name}.jpg")
+        txt_save_path = os.path.join(args.actual_save_dir, f"{base_name}_output.txt")
         cv2.imwrite(img_save_path, frame)
         with open(txt_save_path, "w", encoding="utf-8") as f:
             f.write(f"帧号: {frame_idx} (时间: {video_time_sec:.2f}s)\n耗时: {latency_ms:.1f}ms\nQwen3-VL:\n{output_text}\n")
 
     cap.release()
     print(f"\n✅ 连续遍历分析完成！共完成 {analyzed_count} 帧深度分析。", flush=True)
+    print(f"💾 所有单帧诊断报告与截图已保存至独立目录: {os.path.abspath(args.actual_save_dir)}", flush=True)
 
 
 def main():
@@ -292,11 +290,14 @@ def main():
     parser.add_argument("--skip_to", type=int, default=0, help="stream 模式下跳过前 N 帧")
     parser.add_argument("--max_frames", type=int, default=0, help="stream 模式下最大帧数 (0 表示遍历全视频不限制)")
     parser.add_argument("--max_tokens", type=int, default=512, help="模型最大输出 token 数量 (默认512)")
-    parser.add_argument("--save_dir", type=str, default="./local_cache/understanding_test", help="结果保存路径")
+    parser.add_argument("--save_dir", type=str, default="./local_cache/understanding_test", help="结果根目录")
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help="模型权重目录")
     args = parser.parse_args()
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    # 自动根据视频文件名创建独立的保存子目录 (如: ./local_cache/understanding_test/spark_1/)
+    video_stem = os.path.splitext(os.path.basename(args.video))[0]
+    args.actual_save_dir = os.path.join(args.save_dir, video_stem)
+    os.makedirs(args.actual_save_dir, exist_ok=True)
 
     # 加载模型 (单例)
     model, processor = load_model(args.model_path)
