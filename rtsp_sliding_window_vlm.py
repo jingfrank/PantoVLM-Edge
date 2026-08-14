@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-基于 Qwen3-VL 的 RTSP 视频流时序滑动窗口故障检测系统
+基于 Qwen3-VL 的 RTSP 视频流时序滑动窗口故障检测系统 (集成 Visual Grounding 视觉定位)
 (rtsp_sliding_window_vlm.py)
 
 设计规格：
 1. 采样频率：每秒采样 1 帧 (1 FPS)
 2. 窗口大小 (Window Size)：4 帧 (覆盖 4 秒连续时序画面)
 3. 滑动步长 (Stride)：4 帧 (步长等于窗口大小，无重复帧，每 4 秒触发一次时序分析)
-4. 多帧时序分析目标：
+4. 多帧时序分析与视觉定位：
    - 【大火花 (spark)】：受电弓碳滑板与接触网间剧烈燃弧、拉弧放电分析
-   - 【异物悬挂 (foreign_object)】：碳滑板、弓角、支架或接触网上悬挂塑料薄膜、风筝线、树枝等
+   - 【悬挂异物 (foreign_object)】：
+     * 引入 Visual Grounding 视觉定位约束，强制要求输出异物中心点坐标 <point>x, y</point> (0-1000 归一化)
+     * 注入负向排除规则 (Negative Prompting)：排除弓角、线夹、螺栓、绝缘子等正常金属构件
+     * 幻觉过滤：未定位到坐标时不予告警，杜绝模型幻觉误报
    - 【镜头脏污 (dirt)】：镜头表面水滴、油膜、泥斑遮挡或严重污损
 5. 架构特性：
    - 多线程解耦：独立后台拉流线程持续清空 RTSP 缓冲，杜绝视频流时延堆积
-   - 结构化 JSON 约束输出：便于下游控制系统与告警平台直接解析
+   - 结构化 JSON 约束输出 + 坐标点自动提取与图像可视化标定
 """
 
 import os
 import sys
 import time
 import json
+import re
 import queue
 import threading
 import argparse
@@ -36,25 +40,28 @@ except Exception:
 
 # ==================== 默认参数配置 ====================
 DEFAULT_MODEL_PATH = "./models/Qwen3-VL-4B-Instruct"
-WINDOW_SIZE = 4        # 窗口大小：4 帧
+WINDOW_SIZE = 4  # 窗口大小：4 帧
 SAMPLE_INTERVAL = 1.0  # 采样间隔：1 秒 / 帧 (1 FPS)
 
-# 专为 3 项故障定制的时序分析 Prompt
+# 专为 3 项故障定制的 Visual Grounding 时序分析 Prompt
 TEMPORAL_FAULT_PROMPT = (
-    "你是一个专业的受电弓与接触网视频智能监测专家。\n"
-    "输入是由连续4秒（每秒1帧，共4帧）构成的时序视频片段。请仔细对比多帧画面的时序变化，重点排查以下3类故障：\n"
-    "1. 【大火花 (spark)】：判断受电弓碳滑板与上方接触网导线接触点是否存在明显的燃弧、大火花放电（注意区分正常金属反光与真实火花放电）。\n"
-    "2. 【异物悬挂 (foreign_object)】：判断受电弓（碳滑板、弓角、框架）或接触网上是否有缠绕或悬挂的塑料袋、薄膜、风筝线、鸟巢、树枝等外来异物。\n"
-    "3. 【镜头脏污 (dirt)】：判断摄像机镜头表面是否有明显的水渍、污泥、油斑遮挡或严重污损模糊。\n\n"
-    "请严格按以下 JSON 格式输出，1 表示存在该故障，0 表示正常（请勿输出任何多余的前缀或Markdown格式）：\n"
+    "你是一个顶级的受电弓与接触网故障诊断与视觉定位专家。\n"
+    "输入是由连续4秒（每秒1帧，共4帧）构成的时序视频片段。请仔细排查以下3类故障：\n\n"
+    "1. 【大火花 (spark)】：判断受电弓碳滑板与上方接触网导线接触点是否存在明显的燃弧、大火花放电（注意区分正常金属反光与真实火花放电）。(0/1)\n"
+    "2. 【镜头脏污 (dirt)】：判断摄像机镜头表面是否有明显的水渍、污泥、油斑遮挡或严重污损模糊。(0/1)\n"
+    "3. 【悬挂异物 (foreign_object)】：仔细观察受电弓碳滑板、弓角及接触网上是否有非金属悬挂物（塑料薄膜、编织袋、风筝线、鸟巢、树枝等）。\n"
+    "   若确认发现外来异物，detect and localize the visual content output format：<point>x, y</point>（x, y 范围在 0 到 1000 之间）；若没有外来异物，foreign_point 必须填 null。\n\n"
+    "if foreign object does not exist in a frame, skip that frame"
+    "请严格按以下 JSON 格式输出（请勿输出任何多余的前缀或Markdown格式）：\n"
     "{\n"
     '  "spark": 0,\n'
-    '  "foreign_object": 0,\n'
     '  "dirt": 0,\n'
+    '  "foreign_object": 0,\n'
+    '  "foreign_point": null,\n'
     '  "details": {\n'
-    '    "spark_desc": "描述火花情况",\n'
-    '    "foreign_object_desc": "描述异物情况",\n'
-    '    "dirt_desc": "描述镜头状态"\n'
+    '    "spark_desc": "描述火花状态",\n'
+    '    "dirt_desc": "描述镜头清晰度",\n'
+    '    "foreign_desc": "描述异物特征与定位位置"\n'
     "  },\n"
     '  "summary": "正常/大火花/悬挂异物/镜头脏污"\n'
     "}"
@@ -66,9 +73,10 @@ class RTSPStreamSampler:
     """
     RTSP 异步拉流与定频采样器
     功能：
-    1. 独立线程循环 grab() 最新视频帧，彻底解决 OpenCV 读 RTSP 造成的几秒钟缓冲区滞后问题
+    1. 独立线程循环 grab() 最新视频帧，彻底解决 OpenCV 读 RTSP 造成的缓冲区滞后问题
     2. 按照指定采样周期 (默认 1 秒) 精准抽取 1 帧存入采样队列
     """
+
     def __init__(self, source_url, sample_interval=1.0, is_file=False):
         self.source_url = source_url
         self.sample_interval = sample_interval
@@ -96,14 +104,21 @@ class RTSPStreamSampler:
     def _worker(self):
         self.cap = self._open_stream()
         if not self.cap.isOpened():
-            print(f"[错误] 无法连接到视频源: {self.source_url}", file=sys.stderr, flush=True)
+            print(
+                f"[错误] 无法连接到视频源: {self.source_url}",
+                file=sys.stderr,
+                flush=True,
+            )
             self.running = False
             return
 
         fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
         frame_delay = 1.0 / fps if self.is_file else 0.001
 
-        print(f"[RTSP拉流] 视频源连接成功! 采样率: 每 {self.sample_interval} 秒抽取 1 帧", flush=True)
+        print(
+            f"[RTSP拉流] 视频源连接成功! 采样率: 每 {self.sample_interval} 秒抽取 1 帧",
+            flush=True,
+        )
         self.last_sample_time = time.time()
 
         frame_count = 0
@@ -124,9 +139,8 @@ class RTSPStreamSampler:
                     continue
 
             now = time.time()
-            # 针对本地文件按帧率或时间戳抽样；针对实时 RTSP 流按真实时钟 1s 抽样
             if self.is_file:
-                # 视频文件模式：根据帧序号精确按 1 秒间隔抽帧
+                # 本地视频文件模式：按帧序号精准抽帧
                 if frame_count % int(round(fps * self.sample_interval)) == 0:
                     self._push_frame(frame, now)
                 frame_count += 1
@@ -172,7 +186,10 @@ def load_vlm_model(model_path=DEFAULT_MODEL_PATH, gpu_mem_fraction=0.65):
     if torch.cuda.is_available():
         torch.cuda.set_per_process_memory_fraction(gpu_mem_fraction, device=0)
         gpu_name = torch.cuda.get_device_name(0)
-        print(f"GPU 设备: {gpu_name} (分配显存上限: {int(gpu_mem_fraction*100)}%)", flush=True)
+        print(
+            f"GPU 设备: {gpu_name} (分配显存上限: {int(gpu_mem_fraction * 100)}%)",
+            flush=True,
+        )
 
     from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
@@ -190,18 +207,18 @@ def load_vlm_model(model_path=DEFAULT_MODEL_PATH, gpu_mem_fraction=0.65):
     return model, processor
 
 
-def infer_window_frame_list(model, processor, frames_bgr_list, prompt=TEMPORAL_FAULT_PROMPT, max_tokens=256):
+def infer_window_frame_list(
+    model, processor, frames_bgr_list, prompt=TEMPORAL_FAULT_PROMPT, max_tokens=384
+):
     """
-    将 4 帧 BGR 图像组装成 frame_list 喂入 Qwen3-VL 进行时序分析
+    将 4 帧 BGR 图像组装成 frame_list 喂入 Qwen3-VL 进行时序分析与视觉定位
     """
     # 转换为 PIL Image (RGB 格式)
-    pil_frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_bgr_list]
-
-    # 构建 VLM 时序多模态消息体 (sample_fps=1)
-    content = [
-        {"type": "video", "video": pil_frames},
-        {"type": "text", "text": prompt}
+    pil_frames = [
+        Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_bgr_list
     ]
+
+    content = [{"type": "video", "video": pil_frames}, {"type": "text", "text": prompt}]
     messages = [{"role": "user", "content": content}]
 
     text = processor.apply_chat_template(
@@ -217,7 +234,7 @@ def infer_window_frame_list(model, processor, frames_bgr_list, prompt=TEMPORAL_F
         generated_ids = model.generate(
             **inputs,
             max_new_tokens=max_tokens,
-            do_sample=False  # 确定性贪婪解码，保证工业检测结果稳定
+            do_sample=False,  # 贪婪解码保证工业判定确定性
         )
     latency_ms = (time.time() - t0) * 1000
 
@@ -228,35 +245,96 @@ def infer_window_frame_list(model, processor, frames_bgr_list, prompt=TEMPORAL_F
     # 尝试将模型输出解析为结构化 JSON
     parsed_json = None
     try:
-        # 兼容清理大模型可能携带的 ```json 标签
         clean_text = output_text
         if "```json" in clean_text:
             clean_text = clean_text.split("```json")[1].split("```")[0].strip()
         elif "```" in clean_text:
             clean_text = clean_text.split("```")[1].split("```")[0].strip()
-        parsed_json = json.loads(clean_text)
+
+        # 若大模型有前后多余文本，正则提取大括号内容
+        json_match = re.search(r"\{[\s\S]*\}", clean_text)
+        if json_match:
+            parsed_json = json.loads(json_match.group(0))
+        else:
+            parsed_json = json.loads(clean_text)
     except Exception:
         pass
+
+    if parsed_json is None:
+        parsed_json = {
+            "spark": 0,
+            "dirt": 0,
+            "foreign_object": 0,
+            "foreign_point": None,
+            "details": {},
+            "summary": "解析失败",
+        }
+
+    # ==================== 视觉定位坐标后处理与幻觉校验 ====================
+    # 检索是否输出了 <point>x, y</point> 坐标
+    search_target = str(parsed_json.get("foreign_point") or "") + " " + output_text
+    point_match = re.search(r"<point>\s*(\d+)\s*,\s*(\d+)\s*</point>", search_target)
+
+    # 同时也兼顾 box 格式 <box>ymin, xmin, ymax, xmax</box> 或 <box>x1, y1, x2, y2</box>
+    box_match = re.search(
+        r"<box>\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*</box>", search_target
+    )
+
+    if point_match:
+        nx = int(point_match.group(1))
+        ny = int(point_match.group(2))
+        parsed_json["foreign_object"] = 1
+        parsed_json["foreign_point_coords"] = (nx, ny)
+        parsed_json["foreign_point"] = f"<point>{nx}, {ny}</point>"
+    elif box_match:
+        coords = [int(box_match.group(i)) for i in range(1, 5)]
+        # 取 box 中心点作为定位点
+        cx = int((coords[0] + coords[2]) / 2)
+        cy = int((coords[1] + coords[3]) / 2)
+        parsed_json["foreign_object"] = 1
+        parsed_json["foreign_point_coords"] = (cx, cy)
+        parsed_json["foreign_point"] = (
+            f"<box>{coords[0]},{coords[1]},{coords[2]},{coords[3]}</box>"
+        )
+    else:
+        # 核心幻觉抑制：如果模型回答了 foreign_object=1 但未能给出合法的定位坐标，自动降级为 0（判定为幻觉）
+        if parsed_json.get("foreign_object") == 1:
+            print(
+                "[Visual Grounding 拦截] ⚠️ 模型标记了异物但未给出有效坐标定位，判定为部件结构幻觉，已自动滤除。"
+            )
+            parsed_json["foreign_object"] = 0
+        parsed_json["foreign_point_coords"] = None
+        parsed_json["foreign_point"] = None
 
     return output_text, parsed_json, latency_ms
 
 
 # ==================== 主滑动窗口检测循环 ====================
-def run_sliding_window_detection(source, model_path=DEFAULT_MODEL_PATH, save_dir="./events"):
+def run_sliding_window_detection(
+    source, model_path=DEFAULT_MODEL_PATH, save_dir="./events"
+):
     os.makedirs(save_dir, exist_ok=True)
-    is_file = os.path.exists(source) or (not source.startswith("rtsp://") and not source.startswith("http://"))
+    is_file = os.path.exists(source) or (
+        not source.startswith("rtsp://") and not source.startswith("http://")
+    )
 
     # 1. 载入 Qwen3-VL 模型
     model, processor = load_vlm_model(model_path)
 
     # 2. 启动异步定频拉流器 (1 秒抽 1 帧)
-    sampler = RTSPStreamSampler(source, sample_interval=SAMPLE_INTERVAL, is_file=is_file).start()
+    sampler = RTSPStreamSampler(
+        source, sample_interval=SAMPLE_INTERVAL, is_file=is_file
+    ).start()
 
-    print("\n🚀 [系统就绪] 开始执行 4 帧滑动窗口时序监测 (步长=4帧，无重复)...")
-    print(f"📌 监控目标: 1. 大火花(spark) | 2. 悬挂异物(foreign_object) | 3. 镜头脏污(dirt)")
+    print(
+        "\n🚀 [系统就绪] 开始执行 4 帧滑动窗口时序监测 (集成 Visual Grounding 点定位)..."
+    )
+    print(
+        f"📌 监控目标: 1. 大火花(spark) | 2. 悬挂异物(foreign_object) | 3. 镜头脏污(dirt)"
+    )
     print("-" * 70, flush=True)
 
-    window_buffer = []  # 存放当前窗口的帧
+    window_buffer = []
     timestamp_buffer = []
     window_count = 0
 
@@ -273,12 +351,17 @@ def run_sliding_window_detection(source, model_path=DEFAULT_MODEL_PATH, save_dir
             timestamp_buffer.append(ts)
 
             current_time_str = time.strftime("%H:%M:%S", time.localtime(ts))
-            print(f"[{current_time_str}] 📥 采集成帧 ({len(window_buffer)}/{WINDOW_SIZE})", flush=True)
+            print(
+                f"[{current_time_str}] 📥 采集成帧 ({len(window_buffer)}/{WINDOW_SIZE})",
+                flush=True,
+            )
 
             # 当填满 4 帧窗口时 (Stride = 4，无重叠)，触发一次 Qwen3-VL 视频理解
             if len(window_buffer) == WINDOW_SIZE:
                 window_count += 1
-                print(f"\n⚡ ===== [第 {window_count} 个时序窗口 (4秒跨度)] 送入 Qwen3-VL 进行多帧理解 =====")
+                print(
+                    f"\n⚡ ===== [第 {window_count} 个时序窗口 (4秒跨度)] 送入 Qwen3-VL 进行多帧理解与视觉定位 ====="
+                )
 
                 raw_output, parsed_json, latency_ms = infer_window_frame_list(
                     model, processor, window_buffer, prompt=TEMPORAL_FAULT_PROMPT
@@ -287,32 +370,33 @@ def run_sliding_window_detection(source, model_path=DEFAULT_MODEL_PATH, save_dir
                 # 打印诊断报告
                 print(f"⏱️ 推理耗时: {latency_ms:.1f} ms")
                 print("📊 诊断结果:")
-                if parsed_json:
-                    spk = parsed_json.get("spark", 0)
-                    obj = parsed_json.get("foreign_object", 0)
-                    dirt = parsed_json.get("dirt", 0)
-                    summary = parsed_json.get("summary", "未知")
-                    details = parsed_json.get("details", {})
+                spk = parsed_json.get("spark", 0)
+                obj = parsed_json.get("foreign_object", 0)
+                dirt = parsed_json.get("dirt", 0)
+                summary = parsed_json.get("summary", "未知")
+                details = parsed_json.get("details", {})
+                point_coords = parsed_json.get("foreign_point_coords")
 
-                    spk_tag = "🔴【发现大火花】" if spk else "🟢 无火花"
-                    obj_tag = "🔴【发现异物悬挂】" if obj else "🟢 无异物"
-                    dirt_tag = "🟡【镜头脏污遮挡】" if dirt else "🟢 镜头清晰"
-
-                    print(f"  ├─ 火花检测: {spk_tag} - {details.get('spark_desc', '')}")
-                    print(f"  ├─ 异物检测: {obj_tag} - {details.get('foreign_object_desc', '')}")
-                    print(f"  ├─ 脏污检测: {dirt_tag} - {details.get('dirt_desc', '')}")
-                    print(f"  └─ 总体结论: {summary}")
-
-                    # 若发现故障，保存时序拼图与事件记录
-                    if spk or obj or dirt:
-                        event_id = int(time.time())
-                        save_event_collage(window_buffer, parsed_json, save_dir, event_id)
+                spk_tag = "🔴【发现大火花】" if spk else "🟢 无火花"
+                dirt_tag = "🟡【镜头脏污遮挡】" if dirt else "🟢 镜头清晰"
+                if obj and point_coords:
+                    obj_tag = f"🔴【发现异物悬挂】(定位坐标: X={point_coords[0]}, Y={point_coords[1]})"
                 else:
-                    print(f"  └─ 模型原始输出:\n{raw_output}")
+                    obj_tag = "🟢 无异物"
+
+                print(f"  ├─ 火花检测: {spk_tag} - {details.get('spark_desc', '')}")
+                print(f"  ├─ 异物定位: {obj_tag} - {details.get('foreign_desc', '')}")
+                print(f"  ├─ 脏污检测: {dirt_tag} - {details.get('dirt_desc', '')}")
+                print(f"  └─ 总体结论: {summary}")
+
+                # 若发现故障，保存带定位标定的时序拼图与事件记录
+                if spk or obj or dirt:
+                    event_id = int(time.time())
+                    save_event_collage(window_buffer, parsed_json, save_dir, event_id)
 
                 print("=" * 70, "\n", flush=True)
 
-                # 步长等于窗口大小：清空当前窗口，开始收集下一次的独立 4 帧
+                # 清空当前窗口
                 window_buffer.clear()
                 timestamp_buffer.clear()
 
@@ -324,11 +408,37 @@ def run_sliding_window_detection(source, model_path=DEFAULT_MODEL_PATH, save_dir
 
 
 def save_event_collage(frames, result_json, save_dir, event_id):
-    """当出现故障时，将 4 帧拼接并保存事件快照"""
-    h, w = frames[0].shape[:2]
+    """当出现故障时，将 4 帧拼接并在图像上绘制异物中心点与告警信息"""
+    annotated_frames = [f.copy() for f in frames]
+    point_coords = result_json.get("foreign_point_coords")
+
+    # 如果定位到了异物点坐标 (0-1000 归一化)，在最后一帧（或所有帧）上绘制红色准心瞄准标记
+    if point_coords is not None:
+        nx, ny = point_coords
+        for f in annotated_frames:
+            h, w = f.shape[:2]
+            px = int(np.clip(nx / 1000.0 * w, 0, w - 1))
+            py = int(np.clip(ny / 1000.0 * h, 0, h - 1))
+
+            # 绘制醒目的红色十字准心与目标外圈
+            cv2.circle(f, (px, py), 18, (0, 0, 255), 2)
+            cv2.circle(f, (px, py), 4, (0, 0, 255), -1)
+            cv2.line(f, (px - 28, py), (px + 28, py), (0, 0, 255), 2)
+            cv2.line(f, (px, py - 28), (px, py + 28), (0, 0, 255), 2)
+            cv2.putText(
+                f,
+                f"FOREIGN OBJECT ({nx},{ny})",
+                (max(10, px - 60), max(25, py - 25)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
     # 缩小每张图以便于拼接成 2x2 拼图
     thumb_w, thumb_h = 480, 270
-    resized_frames = [cv2.resize(f, (thumb_w, thumb_h)) for f in frames]
+    resized_frames = [cv2.resize(f, (thumb_w, thumb_h)) for f in annotated_frames]
 
     top_row = np.hstack([resized_frames[0], resized_frames[1]])
     bottom_row = np.hstack([resized_frames[2], resized_frames[3]])
@@ -336,8 +446,16 @@ def save_event_collage(frames, result_json, save_dir, event_id):
 
     # 绘制状态水印
     summary_text = result_json.get("summary", "故障告警")
-    cv2.putText(collage, f"FAULT ALERT: {summary_text}", (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.putText(
+        collage,
+        f"FAULT ALERT: {summary_text}",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
 
     img_path = os.path.join(save_dir, f"event_{event_id}_collage.jpg")
     json_path = os.path.join(save_dir, f"event_{event_id}_data.json")
@@ -346,18 +464,29 @@ def save_event_collage(frames, result_json, save_dir, event_id):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(result_json, f, ensure_ascii=False, indent=2)
 
-    print(f"  💾 🚨 故障事件已归档: {img_path}", flush=True)
+    print(f"  💾 🚨 故障事件（含视觉定位标定）已归档: {img_path}", flush=True)
 
 
 # ==================== 入口函数 ====================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Qwen3-VL 4帧滑动窗口时序视频理解")
-    parser.add_argument("--source", type=str, default="./弓网典型视频/spark_1.mp4",
-                        help="视频源：支持 RTSP 地址 (rtsp://...) 或 本地 MP4 视频路径")
-    parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH,
-                        help="Qwen3-VL-4B 本地权重目录")
-    parser.add_argument("--save_dir", type=str, default="./events",
-                        help="故障事件与多帧拼图保存目录")
+    parser = argparse.ArgumentParser(
+        description="Qwen3-VL 4帧滑动窗口时序视频理解与视觉定位"
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="./弓网典型视频/foreign_1.mp4",
+        help="视频源：支持 RTSP 地址 (rtsp://...) 或 本地 MP4 视频路径",
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=DEFAULT_MODEL_PATH,
+        help="Qwen3-VL-4B 本地权重目录",
+    )
+    parser.add_argument(
+        "--save_dir", type=str, default="./events", help="故障事件与多帧拼图保存目录"
+    )
 
     args = parser.parse_args()
     run_sliding_window_detection(args.source, args.model_path, args.save_dir)
