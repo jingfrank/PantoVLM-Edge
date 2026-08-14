@@ -49,15 +49,15 @@ TEMPORAL_FAULT_PROMPT = (
     "输入是由连续4秒（每秒1帧，共4帧）构成的时序视频片段。请仔细排查以下3类故障：\n\n"
     "1. 【大火花 (spark)】：判断受电弓碳滑板与上方接触网导线接触点是否存在明显的燃弧、大火花放电（注意区分正常金属反光与真实火花放电）。(0/1)\n"
     "2. 【镜头脏污 (dirt)】：判断摄像机镜头表面是否有明显的水渍、污泥、油斑遮挡或严重污损模糊。(0/1)\n"
-    "3. 【悬挂异物 (foreign_object)】：受电弓碳滑板上高度怀疑有附着异物（塑料薄膜、编织袋、风筝线、鸟巢、树枝等）。\n"
-    "detect and localize the visual content output format：<point>x, y</point>（x, y 坐标均在 0 到 1000 之间）；若没有外来异物，foreign_point 必须填 null。\n\n"
+    "3. 【悬挂异物 (foreign_object)】：受电弓碳滑板（顶部横梁）上高度怀疑有附着异物（塑料薄膜、编织袋、风筝线、鸟巢、树枝等）。\n"
+    "对于发现的非金属悬挂物/异物，请找出它最清晰的一帧（序号1-4），并输出对应帧序号和中心点坐标。格式必须为：frame <序号> <point>x, y</point>（x, y 坐标均在 0 到 1000 之间）；若没有外来异物，foreign_point 必须填 null。\n\n"
     "if foreign object does not exist in a frame, skip that frame。\n"
-    "请严格按以下 JSON 格式输出（请勿输出任何多余的前缀或Markdown格式）：\n"
+    "请严格按以下 JSON 格式输出：\n"
     "{\n"
     '  "spark": 0,\n'
     '  "dirt": 0,\n'
-    '  "foreign_object": 0,\n'
-    '  "foreign_point": null,\n'
+    '  "foreign_object": 1,\n'
+    '  "foreign_point": "frame 2 <point>x, y</point>",\n'
     '  "details": {\n'
     '    "spark_desc": "描述火花状态",\n'
     '    "dirt_desc": "描述镜头清晰度",\n'
@@ -275,12 +275,24 @@ def infer_window_frame_list(
     search_target = str(parsed_json.get("foreign_point") or "") + " " + output_text
     point_match = re.search(r"<point>\s*(\d+)\s*,\s*(\d+)\s*</point>", search_target)
 
+    # 提取帧序号 frame_num (如 frame 2, 默认为 4)
+    frame_num = 4
+    fm = re.search(r'(?i)frame\s*(\d)', search_target)
+    if fm:
+        try:
+            fn = int(fm.group(1))
+            if 1 <= fn <= 4:
+                frame_num = fn
+        except:
+            pass
+
     if point_match:
         nx = int(point_match.group(1))
         ny = int(point_match.group(2))
         parsed_json["foreign_object"] = 1
         parsed_json["foreign_point_coords"] = (nx, ny)
-        parsed_json["foreign_point"] = f"<point>{nx}, {ny}</point>"
+        parsed_json["frame_num"] = frame_num
+        parsed_json["foreign_point"] = f"frame {frame_num} <point>{nx}, {ny}</point>"
     else:
         # 兼容括号 (x, y) 格式
         paren_match = re.search(r"\((\d+)\s*,\s*(\d+)\)", search_target)
@@ -289,7 +301,8 @@ def infer_window_frame_list(
             ny = int(paren_match.group(2))
             parsed_json["foreign_object"] = 1
             parsed_json["foreign_point_coords"] = (nx, ny)
-            parsed_json["foreign_point"] = f"<point>{nx}, {ny}</point>"
+            parsed_json["frame_num"] = frame_num
+            parsed_json["foreign_point"] = f"frame {frame_num} <point>{nx}, {ny}</point>"
         else:
             # 核心幻觉抑制：如果模型回答了 foreign_object=1 但未能给出合法的定位点坐标，自动降级为 0
             if parsed_json.get("foreign_object") == 1:
@@ -298,6 +311,7 @@ def infer_window_frame_list(
                 )
                 parsed_json["foreign_object"] = 0
             parsed_json["foreign_point_coords"] = None
+            parsed_json["frame_num"] = None
             parsed_json["foreign_point"] = None
 
     return output_text, parsed_json, latency_ms
@@ -383,10 +397,10 @@ def run_sliding_window_detection(
                 print(f"  ├─ 脏污检测: {dirt_tag} - {details.get('dirt_desc', '')}")
                 print(f"  └─ 总体结论: {summary}")
 
-                # 若发现故障，保存带定位标定的时序拼图与事件记录
+                # 若发现故障，保存带定位标定的高清原图
                 if spk or obj or dirt:
                     event_id = int(time.time())
-                    save_event_collage(window_buffer, parsed_json, save_dir, event_id)
+                    save_event_hd_frame(window_buffer, parsed_json, save_dir, event_id)
 
                 print("=" * 70, "\n", flush=True)
 
