@@ -12,25 +12,29 @@ import cv2
 import torch
 from PIL import Image
 
+
 class TwoStageVLMEngine:
     def __init__(self, algo_cfg):
         self.algo_cfg = algo_cfg
-        model_path = algo_cfg.get("downloaded_model_path", "./models/Qwen3-VL-4B-Instruct")
-        
+        model_path = algo_cfg.get(
+            "downloaded_model_path", "./models/Qwen3-VL-4B-Instruct"
+        )
+
         # 运行时平台检测与显存配额保护
         try:
             from platform_utils import get_gpu_memory_fraction
+
             mem_frac = get_gpu_memory_fraction()
         except ImportError:
             mem_frac = 0.50
 
         if torch.cuda.is_available():
             torch.cuda.set_per_process_memory_fraction(mem_frac, device=0)
-            print(f"[VLM-Engine] 🛡️ 已启用 {mem_frac*100}% GPU 显存配额保护")
+            print(f"[VLM-Engine] 🛡️ 已启用 {mem_frac * 100}% GPU 显存配额保护")
 
         print("[VLM-Engine] 正在向 GPU 加载模型 (FP16)...")
         from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-        
+
         self.processor = AutoProcessor.from_pretrained(model_path)
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_path,
@@ -47,7 +51,7 @@ class TwoStageVLMEngine:
             "2. 脏污(dirt)：画面是否极度模糊、失焦、或被水滴/污泥遮挡？注意：不要推测模糊的原因！只要画面模糊到难以辨认受电弓细节，就必须判定为脏污(dirt=1)。\n"
             "请先给出一句话的推理分析(reasoning)，描述画面的清晰度，然后再输出JSON。\n"
             "示例 JSON:\n"
-            "{\"reasoning\": \"画面整体极度模糊，无法看清受电弓细节，判定为脏污。\", \"spk\": 0, \"dirt\": 1}"
+            '{"reasoning": "画面整体极度模糊，无法看清受电弓细节，判定为脏污。", "spk": 0, "dirt": 1}'
         )
 
         self.prompt_stage2_spark = (
@@ -67,7 +71,7 @@ class TwoStageVLMEngine:
             "如果画面中只有受电弓本体结构而没有外来异物，请直接回复 'Normal'。"
         )
 
-    def _infer_one(self, pil_img, prompt, max_tokens=128):
+    def _infer_one(self, pil_img, prompt, max_tokens=1024):
         messages = [
             {
                 "role": "user",
@@ -88,10 +92,12 @@ class TwoStageVLMEngine:
         t0 = time.time()
         with torch.no_grad():
             generated_ids = self.model.generate(**inputs, max_new_tokens=max_tokens)
-        
+
         input_len = inputs["input_ids"].shape[1]
         new_ids = generated_ids[:, input_len:]
-        output_text = self.processor.batch_decode(new_ids, skip_special_tokens=True)[0].strip()
+        output_text = self.processor.batch_decode(new_ids, skip_special_tokens=True)[
+            0
+        ].strip()
         return output_text
 
     def infer_frame(self, frame_bgr):
@@ -111,10 +117,10 @@ class TwoStageVLMEngine:
         }
         """
         pil_img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-        
+
         # Stage 1
         s1_text = self._infer_one(pil_img, self.prompt_stage1)
-        
+
         try:
             s1_res = json.loads(s1_text)
         except Exception:
@@ -124,18 +130,18 @@ class TwoStageVLMEngine:
         spk = s1_res.get("spk", 0)
         dirt = s1_res.get("dirt", 0)
         reasoning = s1_res.get("reasoning", "")
-        
+
         box_coords = None
         point_coords = None
         obj = 0
 
         # Stage 2 Dynamic Routing
         if dirt == 1:
-            pass # Skip stage 2
+            pass  # Skip stage 2
         elif spk == 1:
             s2_text = self._infer_one(pil_img, self.prompt_stage2_spark)
-            box_pattern1 = r'<box>\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*</box>'
-            box_pattern2 = r'\((\d+)\s*,\s*(\d+)\)\s*,?\s*\((\d+)\s*,\s*(\d+)\)'
+            box_pattern1 = r"<box>\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*</box>"
+            box_pattern2 = r"\((\d+)\s*,\s*(\d+)\)\s*,?\s*\((\d+)\s*,\s*(\d+)\)"
             box_match = re.search(box_pattern1, s2_text)
             if not box_match:
                 box_match = re.search(box_pattern2, s2_text)
@@ -145,8 +151,8 @@ class TwoStageVLMEngine:
                     box_coords = tuple(raw_coords)
         else:
             s2_text = self._infer_one(pil_img, self.prompt_stage2_foreign)
-            point_pattern1 = r'<point>\s*(\d+)\s*,\s*(\d+)\s*</point>'
-            point_pattern2 = r'\((\d+)\s*,\s*(\d+)\)'
+            point_pattern1 = r"<point>\s*(\d+)\s*,\s*(\d+)\s*</point>"
+            point_pattern2 = r"\((\d+)\s*,\s*(\d+)\)"
             point_match = re.search(point_pattern1, s2_text)
             if not point_match:
                 point_match = re.search(point_pattern2, s2_text)
@@ -158,10 +164,10 @@ class TwoStageVLMEngine:
             "spk": spk,
             "dirt": dirt,
             "obj": obj,
-            "str": 0,    # Placeholder for structure anomaly
-            "tilt": 0,   # Placeholder for tilt
-            "flt": 0,    # Placeholder for abnormal float
+            "str": 0,  # Placeholder for structure anomaly
+            "tilt": 0,  # Placeholder for tilt
+            "flt": 0,  # Placeholder for abnormal float
             "box": box_coords,
             "point": point_coords,
-            "reasoning": reasoning
+            "reasoning": reasoning,
         }
