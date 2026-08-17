@@ -1,0 +1,14 @@
+# 忽略大型权重文件与测试视频 (挂载方式引入，无需打入镜像层)
+models/
+*.mp4
+*.bak
+local_cache/
+.git
+__pycache__
+*.pyc
+*.tar
+*.tar.gz
+*.png
+*.jpg
+弓网典型视频/
+视频/
