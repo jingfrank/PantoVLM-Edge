@@ -36,6 +36,11 @@ class TwoStageVLMEngine:
         from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(model_path)
+        if hasattr(self.processor, "video_processor") and self.processor.video_processor is not None:
+            self.processor.video_processor.size = {
+                "shortest_edge": 64 * 32 * 32,
+                "longest_edge": int(960 * 720 * 2),
+            }
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_path,
             dtype=torch.float16,

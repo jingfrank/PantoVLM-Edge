@@ -26,7 +26,7 @@ except Exception:
 # ==================== 默认参数配置 ====================
 DEFAULT_MODEL_PATH = "./models/Qwen3-VL-4B-Instruct"
 WINDOW_SIZE = 4  # 窗口大小：4 帧
-SAMPLE_INTERVAL = 1.0  # 采样间隔：1 秒 / 帧 (1 FPS)
+SAMPLE_INTERVAL = 1  # 采样间隔：1 秒 / 帧 (1 FPS)
 
 # =============================================
 # Stage 1 Prompt: 火花 & 脏污全局分类 (保持原版内容)
@@ -34,7 +34,7 @@ SAMPLE_INTERVAL = 1.0  # 采样间隔：1 秒 / 帧 (1 FPS)
 PROMPT_STAGE1 = (
     "你是受电弓故障诊断专家。请观察图像，判断：\n"
     "1. 火花(spk)：有无刺眼强光或电弧放电？\n"
-    "2. 脏污(dirt)：画面是否极度模糊、失焦、或被水滴/污泥遮挡？注意：不要推测模糊的原因！只要画面模糊到难以辨认受电弓细节，就必须判定为脏污(dirt=1)。\n"
+    "2. 脏污(dirt)：画面是否影响了视野，极度模糊、失焦、或被水珠/雾气/污泥遮挡？\n"
     "请先给出一句话的推理分析(reasoning)，描述画面的清晰度，然后再输出JSON。\n"
     "示例 JSON:\n"
     '{"reasoning": "画面整体极度模糊，无法看清受电弓细节，判定为脏污。", "spk": 0, "dirt": 1}'
@@ -55,11 +55,10 @@ PROMPT_STAGE2_SPARK = (
 # Stage 2B Prompt: 悬挂异物 <point> 点定位 (保持原版内容)
 # =============================================
 PROMPT_STAGE2_FOREIGN = (
-    "你是一个视觉定位专家。\n"
     "观察受电弓碳滑板（最上方的弧形横梁）及其附近的接触网区域。\n"
-    "找出不属于受电弓结构的悬挂异物（如塑料薄膜、编织袋碎片、棉纱线头、鸟窝、羽毛等），"
-    "若有异物，输出中心点坐标：<point>x, y</point>（0-1000归一化，原点左上角）。\n"
-    "金属部件（弓角、线夹、螺栓、卡扣、铰接关节等）不是异物！\n"
+    "找出不属于受电弓结构的悬挂异物（如编织袋碎片、棉纱线头、鸟窝、羽毛等），"
+    "若有异物，请用一句话描述该异物的外观和具体位置，最后输出中心点坐标：<point>x, y</point>（0-1000归一化，原点左上角）。\n"
+    "金属部件（弓角、线夹、螺栓、卡扣、铰接关节等）不是异物，模糊的背景也不是异物！\n"
     "若无异物，只回复 'Normal'。"
 )
 
@@ -181,6 +180,16 @@ def load_vlm_model(model_path=DEFAULT_MODEL_PATH, gpu_mem_fraction=0.65):
 
     t0 = time.time()
     processor = AutoProcessor.from_pretrained(model_path)
+
+    # 🎯 性能优化：配置视频分辨率上限（720P 均衡档）
+    # 避免默认配置将 2048x1536 视频超采样至 4096x3072（产生 2.4 万 Tokens、5.4s 延迟）
+    # 设置后 4 帧视频等效约为 1344x960（~2500 Tokens），单次推理降至 ~500ms
+    if hasattr(processor, "video_processor") and processor.video_processor is not None:
+        processor.video_processor.size = {
+            "shortest_edge": 64 * 32 * 32,
+            "longest_edge": int(960 * 720 * 2),
+        }
+
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_path,
         dtype=torch.float16,
@@ -229,8 +238,8 @@ def infer_video(model, processor, frames_bgr_list, prompt, max_tokens=128):
 
 
 # ==================== 结果保存 ====================
-def save_event_collage(frames, parsed_json, save_dir, event_id):
-    """保存 4 帧拼接的 2x2 拼图作为标定图"""
+def save_event_frames(frames, parsed_json, save_dir, event_id):
+    """保存 4 帧独立的高清事件截图 (每帧单独保存，保留原始分辨率与标定)"""
     annotated_frames = [f.copy() for f in frames]
 
     # 解析故障
@@ -241,10 +250,19 @@ def save_event_collage(frames, parsed_json, save_dir, event_id):
     box_coords = parsed_json.get("box_coords")
     point_coords = parsed_json.get("point_coords")
 
-    for f in annotated_frames:
+    labels = []
+    if spk == 1:
+        labels.append("SPARK")
+    if dirt == 1:
+        labels.append("DIRT")
+    if obj == 1:
+        labels.append("FOREIGN_OBJ")
+    status_str = " | ".join(labels) if labels else "DETECTED"
+
+    for idx, f in enumerate(annotated_frames, start=1):
         h, w = f.shape[:2]
 
-        # 绘制 Box (Spark)
+        # 1. 绘制 Box (Spark)
         if spk == 1 and box_coords:
             nx1, ny1, nx2, ny2 = box_coords
             x1 = max(0, min(w, int(nx1 / 1000.0 * w)))
@@ -262,59 +280,63 @@ def save_event_collage(frames, parsed_json, save_dir, event_id):
                 2,
             )
 
-        # 绘制 Point (Foreign Object)
+        # 2. 绘制 Point (Foreign Object)
         elif obj == 1 and point_coords:
             nx, ny = point_coords
-            px = int(np.clip(nx / 1000.0 * w, 0, w - 1))
-            py = int(np.clip(ny / 1000.0 * h, 0, h - 1))
-            cv2.circle(f, (px, py), 20, (0, 255, 255), 1)
-            cv2.circle(f, (px, py), 14, (0, 0, 255), 2)
+            # 1. 映射到像素坐标 (对齐 test_point_foreign_object.py)
+            px = int(nx / 1000.0 * w)
+            py = int(ny / 1000.0 * h)
+
+            # 2. 限制坐标在有效图像范围内
+            px = max(0, min(w - 1, px))
+            py = max(0, min(h - 1, py))
+
+            # 3. 绘制同心圆与 Crosshair 准星十字线 (对齐 test_point_foreign_object.py)
+            cv2.circle(f, (px, py), 15, (0, 0, 255), 3)
             cv2.circle(f, (px, py), 4, (0, 0, 255), -1)
-            cv2.line(f, (px - 26, py), (px + 26, py), (0, 0, 255), 2)
-            cv2.line(f, (px, py - 26), (px, py + 26), (0, 0, 255), 2)
+            cv2.line(f, (px - 25, py), (px + 25, py), (0, 0, 255), 2)
+            cv2.line(f, (px, py - 25), (px, py + 25), (0, 0, 255), 2)
             cv2.putText(
                 f,
-                f"POINT ({nx},{ny})",
-                (max(10, px - 40), max(25, py - 25)),
+                f"Foreign Object Point ({px},{py})",
+                (max(px - 100, 10), max(py - 30, 30)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
+                0.8,
                 (0, 0, 255),
                 2,
-                cv2.LINE_AA,
             )
 
-    # 缩小每张图以便于拼接成 2x2 拼图
-    thumb_w, thumb_h = 480, 270
-    resized_frames = [cv2.resize(f, (thumb_w, thumb_h)) for f in annotated_frames]
+        # 3. 绘制 Dirt (如果发生脏污)
+        elif dirt == 1:
+            cv2.putText(
+                f,
+                "WARNING: Dirt / Blur Detected",
+                (50, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 165, 255),
+                2,
+            )
 
-    top_row = np.hstack([resized_frames[0], resized_frames[1]])
-    bottom_row = np.hstack([resized_frames[2], resized_frames[3]])
-    collage = np.vstack([top_row, bottom_row])
+        # 4. 标注当前事件与帧序号水印
+        cv2.putText(
+            f,
+            f"EVENT: {event_id} | Frame {idx}/{len(frames)} | {status_str}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
-    # 生成水印
-    labels = []
-    if spk == 1:
-        labels.append("SPARK")
-    if dirt == 1:
-        labels.append("DIRT")
-    if obj == 1:
-        labels.append("FOREIGN_OBJ")
-    status_str = " | ".join(labels) if labels else "DETECTED"
+        img_path = os.path.join(save_dir, f"event_{event_id}_f{idx}.jpg")
+        cv2.imwrite(img_path, f)
 
-    cv2.putText(
-        collage,
-        f"EVENT: {event_id} | {status_str}",
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (0, 0, 255),
-        2,
-        cv2.LINE_AA,
+    print(
+        f"  💾 🚨 事件 4 帧全量截图已保存至: {save_dir}/event_{event_id}_f[1-4].jpg",
+        flush=True,
     )
-
-    img_path = os.path.join(save_dir, f"event_{event_id}_collage.jpg")
-    cv2.imwrite(img_path, collage)
-    print(f"  💾 🚨 拼图事件截图已保存至: {img_path}", flush=True)
 
 
 # ==================== 主滑动窗口检测循环 ====================
@@ -413,14 +435,14 @@ def run_twostage_sliding_window(
                         processor,
                         window_buffer,
                         PROMPT_STAGE2_FOREIGN,
-                        max_tokens=128,
+                        max_tokens=256,
                     )
                     point_pattern1 = r"<point>\s*(\d+)\s*,\s*(\d+)\s*</point>"
                     point_pattern2 = r"\((\d+)\s*,\s*(\d+)\)"
                     point_match = re.search(point_pattern1, s2_text)
                     if not point_match:
                         point_match = re.search(point_pattern2, s2_text)
-                    if point_match or "Normal" not in s2_text:
+                    if point_match:
                         obj_detected = 1
 
                 if s2_text:
@@ -453,7 +475,7 @@ def run_twostage_sliding_window(
                         if point_match
                         else None,
                     }
-                    save_event_collage(
+                    save_event_frames(
                         window_buffer, parsed_result, save_dir, int(time.time())
                     )
 
