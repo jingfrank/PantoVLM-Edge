@@ -53,14 +53,14 @@ PROMPT_STAGE2_SPARK = (
 )
 
 # =============================================
-# Stage 2B Prompt: 悬挂异物 <point> 定位 (高清单图 + CoT 思维链)
+# Stage 2B Prompt: 悬挂异物 <point> 定位 (高清单图)
 # =============================================
 PROMPT_STAGE2_FOREIGN = (
     "你是一个受电弓与接触网视觉定位专家。\n"
     "请仔细观察受电弓碳滑板（最上方的弧形横梁）及其正上方的接触网区域。\n"
     "如果发现任何不属于受电弓本体结构的附着物或悬挂物（如附着在滑板上的白色羽毛/絮状物、塑料薄膜、编织袋碎片、棉纱线头等），"
-    "请先用一句话描述该异物的外观和具体位置，最后使用XML格式给出该异物的中心点坐标，格式为：<point>x, y</point>（0到1000归一化，原点在左上角）。\n\n"
-    "【负样本约束】受电弓本体金属部件（弓角、线夹、螺栓、卡扣、接头等）绝不是异物！若无外来异物请直接回复 'Normal'。"
+    "请使用XML格式给出该异物的中心点坐标，格式为：<point>x, y</point>（0到1000归一化，原点在左上角）。\n\n"
+    "【负样本约束】受电弓本体金属部件（弓角、线夹、螺栓、卡扣、接头等）绝不是异物！列车经过站台、灯光密集区、高压线密集区时，因高速运动产生的光源拖影也不是异物。若画面正常无外来异物，请直接回复 'Normal'。"
 )
 
 
@@ -181,7 +181,7 @@ def load_vlm_model(model_path=DEFAULT_MODEL_PATH, gpu_mem_fraction=0.65):
 
     t0 = time.time()
     processor = AutoProcessor.from_pretrained(model_path)
-    
+
     # 🎯 视频流分辨率优化（720P 均衡档，供 Stage 1 使用）
     if hasattr(processor, "video_processor") and processor.video_processor is not None:
         processor.video_processor.size = {
@@ -250,9 +250,7 @@ def infer_single_image(model, processor, frame_bgr, prompt, max_tokens=128):
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    inputs = processor(
-        text=[text], images=[pil_img], padding=True, return_tensors="pt"
-    )
+    inputs = processor(text=[text], images=[pil_img], padding=True, return_tensors="pt")
     inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
     t0 = time.time()
@@ -370,9 +368,7 @@ def run_twostage_sliding_window(
         source, sample_interval=SAMPLE_INTERVAL, is_file=is_file
     ).start()
 
-    print(
-        "\n🚀 [系统就绪] 开始执行 4 帧滑动窗口 + 动静分离两阶段检测系统..."
-    )
+    print("\n🚀 [系统就绪] 开始执行 4 帧滑动窗口 + 动静分离两阶段检测系统...")
     print("   ├─ Stage 1: 4 帧 720P 视频流时序动态诊断 (火花 / 脏污)")
     print("   └─ Stage 2: 最后一帧高清单图 CoT 静态微小异物定位")
     print("-" * 70, flush=True)
@@ -446,7 +442,9 @@ def run_twostage_sliding_window(
                     if not box_match:
                         box_match = re.search(box_pattern2, s2_text)
                 else:
-                    print(f"  🔍 触发 Stage 2B: 悬挂异物 <point> 定位 (最后一帧高清单图 CoT 模式)...")
+                    print(
+                        f"  🔍 触发 Stage 2B: 悬挂异物 <point> 定位 (最后一帧高清单图 CoT 模式)..."
+                    )
                     # 🎯 核心优化：使用最后一帧高清原图进行单图推理，避免视频降采样对微小异物的破坏
                     last_hd_frame = window_buffer[-1]
                     s2_text, s2_ms = infer_single_image(
@@ -454,7 +452,7 @@ def run_twostage_sliding_window(
                         processor,
                         last_hd_frame,
                         PROMPT_STAGE2_FOREIGN,
-                        max_tokens=128,
+                        max_tokens=256,
                     )
                     point_pattern1 = r"<point>\s*(\d+)\s*,\s*(\d+)\s*</point>"
                     point_pattern2 = r"\((\d+)\s*,\s*(\d+)\)"
@@ -462,7 +460,11 @@ def run_twostage_sliding_window(
                     if not point_match:
                         point_match = re.search(point_pattern2, s2_text)
                     if point_match and "Normal" not in s2_text:
-                        obj_detected = 1
+                        coords = tuple(map(int, point_match.groups()))
+                        if not (coords[0] == 0 and coords[1] == 0):
+                            obj_detected = 1
+                        else:
+                            point_match = None
 
                 if s2_text:
                     s2_short = s2_text[:90] + "..." if len(s2_text) > 90 else s2_text

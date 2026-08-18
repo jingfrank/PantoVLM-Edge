@@ -19,6 +19,7 @@ import yaml
 import numpy as np
 import datetime
 import threading
+import queue
 from collections import deque
 from ultralytics import YOLO
 import logging
@@ -171,6 +172,73 @@ def report_event_binary(
         print(f"[ERROR] 发射二进制故障报文失败: {e}", file=sys.stderr)
 
 
+class RTSPStreamSampler:
+    """异步多线程 RTSP / 本地视频拉流采样器"""
+    def __init__(self, source_url, sample_interval=1.0, is_file=False):
+        self.source_url = source_url
+        self.sample_interval = sample_interval
+        self.is_file = is_file
+        self.running = False
+        self.cap = None
+        self.frame_queue = queue.Queue(maxsize=30)
+        self.last_sample_time = 0.0
+
+    def start(self):
+        self.running = True
+        self.cap = cv2.VideoCapture(self.source_url)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"无法打开视频源: {self.source_url}")
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
+        frame_delay = 1.0 / fps if self.is_file else 0.001
+        frame_count = 0
+
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                if self.is_file:
+                    self.frame_queue.put(None)
+                    break
+                else:
+                    time.sleep(1.0)
+                    continue
+
+            now = time.time()
+            if self.is_file:
+                sample_stride = max(1, int(round(fps * self.sample_interval)))
+                if frame_count % sample_stride == 0:
+                    self._push_frame(frame, now)
+                frame_count += 1
+                time.sleep(frame_delay)
+            else:
+                if (now - self.last_sample_time) >= self.sample_interval:
+                    self._push_frame(frame, now)
+                    self.last_sample_time = now
+                time.sleep(frame_delay)
+
+    def _push_frame(self, frame, timestamp):
+        if self.frame_queue.full():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+        self.frame_queue.put((frame, timestamp))
+
+    def get_frame(self, timeout=5.0):
+        try:
+            return self.frame_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def stop(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+
+
 class PantographFaultDetector:
     def __init__(self, global_cfg, stream_cfg, udp_sock, stop_event, vlm_engine):
         self.global_cfg = global_cfg
@@ -228,6 +296,15 @@ class PantographFaultDetector:
         )
         self.frame_buffer = deque(maxlen=buffer_size)
         self.pending_recordings = []
+
+        # 4 帧时序滑动窗口缓冲队列 (1 FPS 采样)
+        self.window_size = 4
+        self.sample_interval = 1.0
+        self.window_buffer = []
+        self.window_count = 0
+        self.last_sample_ts = 0.0
+        self._current_vlm_res = {}
+
         self.ftp_remote_dir = stream_cfg.get(
             "ftp_remote_dir",
             global_cfg.get("ftp_config", {}).get(
@@ -558,38 +635,38 @@ class PantographFaultDetector:
 
     def run(self):
         while not self.stop_event.is_set():
-            cap = None
+            sampler = None
             try:
-                print(
-                    f"[AI-CAR{self.car_number}-CAM{self.camera_id}] 启动 Qwen3-VL 4B 纯大模型实时推理预测 -> {self.rtsp_url}"
+                is_file = os.path.exists(self.rtsp_url) or (
+                    not self.rtsp_url.startswith("rtsp://") and not self.rtsp_url.startswith("http://")
                 )
-                cap = cv2.VideoCapture(self.rtsp_url)
-                if not cap.isOpened():
-                    print(
-                        f"[AI-CAR{self.car_number}-CAM{self.camera_id}] 无法打开 RTSP 视频流: {self.rtsp_url}，5秒后重试..."
-                    )
-                    time.sleep(5)
-                    continue
+                print(
+                    f"[AI-CAR{self.car_number}-CAM{self.camera_id}] 启动 Qwen3-VL 异步流采样器 -> {self.rtsp_url} (is_file={is_file})"
+                )
+                sampler = RTSPStreamSampler(
+                    self.rtsp_url, sample_interval=self.sample_interval, is_file=is_file
+                )
+                sampler.start()
 
-                while not self.stop_event.is_set() and cap.isOpened():
-                    ret, raw_frame = cap.read()
-                    if not ret or raw_frame is None:
-                        print(
-                            f"[AI-CAR{self.car_number}-CAM{self.camera_id}] RTSP 帧读取结束或空帧，重连..."
-                        )
-                        break
+                while not self.stop_event.is_set():
+                    item = sampler.get_frame(timeout=5.0)
+                    if item is None:
+                        if is_file:
+                            print(
+                                f"[AI-CAR{self.car_number}-CAM{self.camera_id}] 测试视频已读取完毕。"
+                            )
+                            break
+                        continue
 
+                    raw_frame, current_ts = item
                     self.frame_count += 1
-                    current_ts = time.time()
+                    self.window_buffer.append(raw_frame.copy())
 
-                    if self.frame_count % 30 == 0:
-                        print(
-                            f"[AI-CAR{self.car_number}-CAM{self.camera_id}] 正在处理第 {self.frame_count} 帧..."
-                        )
+                    # 1. 当收集满 4 帧时，执行 Qwen3-VL 动静分离两阶段深度推理
+                    if len(self.window_buffer) == self.window_size:
+                        self.window_count += 1
+                        vlm_res = self.vlm_engine.infer_window(self.window_buffer)
 
-                    # 1. 纯 Qwen3-VL 4B 深度推理引擎检测（采用抽帧检测以保证处理速度，如15帧检测一次）
-                    if self.frame_count % 30 == 0 or self.frame_count == 1:
-                        vlm_res = self.vlm_engine.infer_frame(raw_frame)
                         # 更新内部状态
                         self.spark_alarmed = bool(vlm_res.get("spk", 0))
                         self.structure_alarmed = bool(vlm_res.get("str", 0))
@@ -598,6 +675,46 @@ class PantographFaultDetector:
                         self.foreign_alarmed = bool(vlm_res.get("obj", 0))
                         self.float_alarmed = bool(vlm_res.get("flt", 0))
                         self._current_vlm_res = vlm_res
+
+                        flags = []
+                        if self.spark_alarmed:
+                            flags.append("🔥 大火花")
+                        if self.dirty_alarmed:
+                            flags.append("🌫️ 画面脏污")
+                        if self.foreign_alarmed:
+                            cand = vlm_res.get("temporal_cand")
+                            hit_cnt = cand.hit_count if cand else 2
+                            flags.append(f"🎯 悬挂异物 (时序已确认! 命中{hit_cnt}次)")
+                        elif vlm_res.get("temporal_status") == "SUSPECT":
+                            cand = vlm_res.get("temporal_cand")
+                            hit_cnt = cand.hit_count if cand else 1
+                            flags.append(f"⏳ 疑似异物 (时序观察中 命中{hit_cnt}/2次, 暂不虚警)")
+                        if self.structure_alarmed:
+                            flags.append("⚠️ 结构异常")
+                        if self.tilt_alarmed:
+                            flags.append("📐 倾斜异常")
+                        if self.float_alarmed:
+                            flags.append("〰️ 异常飘弓")
+                        status_str = " | ".join(flags) if flags else "✅ 正常"
+
+                        print(
+                            f"\n⚡ ===== [AI-CAR{self.car_number}-CAM{self.camera_id}] [时序窗口 #{self.window_count}] Stage 1 & Stage 2 动静分离诊断 ====="
+                        )
+                        print(
+                            f"  ├─ S1 (视频流) 耗时: {vlm_res.get('s1_ms', 0):.0f} ms | 推理: {vlm_res.get('reasoning', '')}"
+                        )
+                        if vlm_res.get("s2_text"):
+                            s2_out = vlm_res.get("s2_text", "")
+                            s2_short = s2_out[:90] + "..." if len(s2_out) > 90 else s2_out
+                            print(f"  ├─ S2 (定位) 耗时: {vlm_res.get('s2_ms', 0):.0f} ms | 输出: {s2_short}")
+
+                        for exp_str in vlm_res.get("temporal_expired_log", []):
+                            print(f"  🛡️ [时序滤波] 成功过滤瞬时偶发误报: {exp_str} (未在后续窗口持续出现)")
+
+                        print(f"  └─ 总体结论: {status_str}")
+                        print("=" * 75, "\n", flush=True)
+
+                        self.window_buffer.clear()
                     else:
                         vlm_res = getattr(self, "_current_vlm_res", {})
 
@@ -752,5 +869,5 @@ class PantographFaultDetector:
                 )
                 time.sleep(5)
             finally:
-                if cap and cap.isOpened():
-                    cap.release()
+                if sampler:
+                    sampler.stop()
