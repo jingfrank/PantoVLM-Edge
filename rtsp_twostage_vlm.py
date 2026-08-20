@@ -55,10 +55,11 @@ PROMPT_STAGE2_SPARK = (
 # Stage 2B Prompt: 悬挂异物 <point> 点定位 (保持原版内容)
 # =============================================
 PROMPT_STAGE2_FOREIGN = (
+    "你是一个视觉定位专家"
     "观察受电弓碳滑板（最上方的弧形横梁）及其附近的接触网区域。\n"
     "找出不属于受电弓结构的悬挂异物（如编织袋碎片、棉纱线头、鸟窝、羽毛等），"
-    "若有异物，请用一句话描述该异物的外观和具体位置，最后输出中心点坐标：<point>x, y</point>（0-1000归一化，原点左上角）。\n"
-    "金属部件（弓角、线夹、螺栓、卡扣、铰接关节等）不是异物，模糊的背景也不是异物！\n"
+    "若有异物，输出中心点坐标：<point>x, y</point>（0-1000归一化，原点左上角）。\n"
+    "金属部件（弓角、线夹、螺栓、卡扣、铰接关节等）不是异物\n"
     "若无异物，只回复 'Normal'。"
 )
 
@@ -181,9 +182,7 @@ def load_vlm_model(model_path=DEFAULT_MODEL_PATH, gpu_mem_fraction=0.65):
     t0 = time.time()
     processor = AutoProcessor.from_pretrained(model_path)
 
-    # 🎯 性能优化：配置视频分辨率上限（720P 均衡档）
-    # 避免默认配置将 2048x1536 视频超采样至 4096x3072（产生 2.4 万 Tokens、5.4s 延迟）
-    # 设置后 4 帧视频等效约为 1344x960（~2500 Tokens），单次推理降至 ~500ms
+    # 视频分辨率上限，控制视觉 token、显存和推理延迟。
     if hasattr(processor, "video_processor") and processor.video_processor is not None:
         processor.video_processor.size = {
             "shortest_edge": 64 * 32 * 32,
@@ -219,7 +218,10 @@ def infer_video(model, processor, frames_bgr_list, prompt, max_tokens=128):
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = processor(
-        text=[text], videos=[pil_frames], padding=True, return_tensors="pt"
+        text=[text],
+        videos=[pil_frames],
+        padding=True,
+        return_tensors="pt",
     )
     inputs = {k: v.to("cuda") for k, v in inputs.items()}
 

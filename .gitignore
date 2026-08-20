@@ -52,3 +52,14 @@ Thumbs.db
 env/
 venv/
 ENV/
+
+# Archives and Container Images
+*.tar.gz
+*.tar
+*.zip
+*.7z
+*.iso
+
+# Evaluation Outputs and Generated CSVs
+timeline_predictions*.csv
+

@@ -29,6 +29,7 @@ base_algorithm_config:
   max_new_tokens: 24
   roi_coordinates: null
   conf_thresh: 0.25
+  foreign_marker_window_seconds: 0.25
 
 
 alarm_push_config:

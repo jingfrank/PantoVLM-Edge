@@ -8,7 +8,7 @@ hardware_config:
 
 video_stream_config:
   streams:
-    - rtsp_url: "./弓网典型视频/spark_1.mp4"
+    - rtsp_url: "./弓网典型视频/foreign_1.mp4"
       camera_id: 0
       car_number: 6
       result_base_dir: "./local_cache/Algo-result"
@@ -29,6 +29,7 @@ base_algorithm_config:
   max_new_tokens: 24
   roi_coordinates: null
   conf_thresh: 0.25
+  foreign_marker_window_seconds: 0.25
 
 
 alarm_push_config:
@@ -55,8 +56,8 @@ phm_config:
     algo_port: 39008
     app_config: "AppConfig.xlsx"
     output_interval_ms: 1000
-    log_status: true
-    log_output: true
+    log_status: false
+    log_output: false
 
 ftp_config:
   enabled: true

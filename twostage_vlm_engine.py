@@ -80,8 +80,11 @@ class TemporalConsistencyTracker:
             if not exp.is_confirmed:
                 expired_log.append(f"点 {exp.point} (仅命中 {exp.hit_count} 次)")
 
-        # 2. 如果本窗口无检出
+        # 2. 如果本窗口无检出，立即清除候选。
+        # 这样“二次确认”必须来自相邻窗口的连续命中，不会出现
+        # “命中 -> 漏检一个窗口 -> 再命中”仍然确认的情况。
         if raw_point is None:
+            self.candidates.clear()
             return "CLEARED", None, None, expired_log
 
         # 3. 尝试与现有候选点进行空间邻近匹配
@@ -258,12 +261,12 @@ class TwoStageVLMEngine:
         )[0].strip()
         return output_text, latency_ms
 
-    def infer_window(self, frames_bgr_list):
+    def infer_window(self, frames_bgr_list, timestamp=None):
         """
         【动静分离两阶段 + 时序一致性滤波滑动窗口推理】
         - Stage 1: 4 帧 720P 视频流时序动态诊断 (火花/脏污)
         - Stage 2: 最后一帧高清单图定位 (悬挂异物)
-        - 时序滤波: 跨窗口校验异物位置连续性，过滤单帧误报
+        - 时序滤波: 使用窗口末帧采集时间，跨相邻窗口校验异物位置连续性
         """
         if not frames_bgr_list:
             return {}
@@ -331,7 +334,8 @@ class TwoStageVLMEngine:
                     raw_point = coords
 
         # ================= 时序一致性滤波校验 =================
-        now = time.time()
+        # 使用采集时间而不是 VLM 推理完成时间，避免推理耗时造成 TTL 判断漂移。
+        now = time.time() if timestamp is None else float(timestamp)
         status, confirmed_pt, cand, expired_log = self.tracker.update(
             raw_point, now, self.window_id
         )
@@ -366,14 +370,14 @@ class TwoStageVLMEngine:
             "temporal_expired_log": expired_log,
         }
 
-    def infer_frame(self, frame_input):
+    def infer_frame(self, frame_input, timestamp=None):
         """
         兼容单帧调用接口：
         如果传入的是单张 BGR 图像 (ndarray)，封装为单帧推理并经由时序追踪器校验；
         如果传入的是图像列表 (list of ndarrays)，则调用 infer_window。
         """
         if isinstance(frame_input, (list, tuple)):
-            return self.infer_window(frame_input)
+            return self.infer_window(frame_input, timestamp=timestamp)
 
         frame_bgr = frame_input
         self.window_id += 1
@@ -433,7 +437,7 @@ class TwoStageVLMEngine:
                 if not (coords[0] == 0 and coords[1] == 0):
                     raw_point = coords
 
-        now = time.time()
+        now = time.time() if timestamp is None else float(timestamp)
         status, confirmed_pt, cand, expired_log = self.tracker.update(
             raw_point, now, self.window_id
         )

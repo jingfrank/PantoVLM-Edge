@@ -55,9 +55,6 @@ def run_twostage_inference():
 
     model_path = "./models/Qwen3-VL-4B-Instruct"
     videos_to_test = [
-        {"name": "大火花测试",   "path": "./弓网典型视频/spark_1.mp4",   "skip_to": 1400},
-        {"name": "极度脏污测试", "path": "./弓网典型视频/dirty_2.mp4",   "skip_to": 1000},
-        {"name": "局部脏污测试", "path": "./弓网典型视频/dirty_1.mp4",   "skip_to": 1000},
         {"name": "悬挂异物测试", "path": "./弓网典型视频/foreign_1.mp4", "skip_to": 800},
     ]
 

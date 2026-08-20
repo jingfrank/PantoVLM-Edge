@@ -21,10 +21,7 @@ import datetime
 import threading
 import queue
 from collections import deque
-from ultralytics import YOLO
-import logging
-
-logging.getLogger("ultralytics").setLevel(logging.ERROR)
+import datetime
 
 FAULT_TYPE_MAP = {
     "大火花": 3,
@@ -297,10 +294,10 @@ class PantographFaultDetector:
         self.frame_buffer = deque(maxlen=buffer_size)
         self.pending_recordings = []
 
-        # 4 帧时序滑动窗口缓冲队列 (1 FPS 采样)
+        # 4 帧时序窗口缓冲队列（1 FPS 采样，窗口步长为 4 帧）
         self.window_size = 4
         self.sample_interval = 1.0
-        self.window_buffer = []
+        self.window_buffer = deque(maxlen=self.window_size)
         self.window_count = 0
         self.last_sample_ts = 0.0
         self._current_vlm_res = {}
@@ -662,10 +659,13 @@ class PantographFaultDetector:
                     self.frame_count += 1
                     self.window_buffer.append(raw_frame.copy())
 
-                    # 1. 当收集满 4 帧时，执行 Qwen3-VL 动静分离两阶段深度推理
+                    # 1. 收集满 4 帧后执行一次推理，再开始收集下一个窗口。
+                    #    Stage2 异物需在两个相邻的 4 秒窗口连续命中且点位接近才告警。
                     if len(self.window_buffer) == self.window_size:
                         self.window_count += 1
-                        vlm_res = self.vlm_engine.infer_window(self.window_buffer)
+                        vlm_res = self.vlm_engine.infer_window(
+                            list(self.window_buffer), timestamp=current_ts
+                        )
 
                         # 更新内部状态
                         self.spark_alarmed = bool(vlm_res.get("spk", 0))
@@ -714,6 +714,7 @@ class PantographFaultDetector:
                         print(f"  └─ 总体结论: {status_str}")
                         print("=" * 75, "\n", flush=True)
 
+                        # 步长为 4：本窗口消费完毕后再收集下一组 4 帧。
                         self.window_buffer.clear()
                     else:
                         vlm_res = getattr(self, "_current_vlm_res", {})

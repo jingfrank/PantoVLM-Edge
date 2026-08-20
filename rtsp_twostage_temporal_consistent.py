@@ -68,6 +68,7 @@ class ForeignObjectCandidate:
         self.point = pt  # (x, y) 归一化坐标 (0-1000)
         self.first_seen_ts = timestamp
         self.last_seen_ts = timestamp
+        self.last_window_id = window_id
         self.hit_count = 1
         self.window_ids = [window_id]
         self.is_confirmed = False
@@ -84,6 +85,7 @@ class ForeignObjectCandidate:
             int(round(self.point[1] * 0.4 + pt[1] * 0.6)),
         )
         self.last_seen_ts = timestamp
+        self.last_window_id = window_id
         self.hit_count += 1
         self.window_ids.append(window_id)
 
@@ -91,29 +93,28 @@ class ForeignObjectCandidate:
 class TemporalConsistencyTracker:
     """
     【时序一致性追踪器】
-    管理异物候选点生命周期，过滤单帧偶发误报，确认持续性真阳性故障。
+    基于窗口跨度(Window Gap)与空间邻近度管理候选点生命周期，
+    彻底解决 GPU 推理延迟导致挂钟 TTL 误超时的缺陷。
     """
-    def __init__(self, match_dist=MATCH_DISTANCE_THRESH, confirm_thresh=CONFIRM_HIT_THRESH, ttl=CANDIDATE_TTL_SECONDS):
+    def __init__(self, match_dist=100.0, confirm_thresh=2, max_window_gap=2, ttl_seconds=30.0):
         self.match_dist = match_dist
         self.confirm_thresh = confirm_thresh
-        self.ttl = ttl
+        self.max_window_gap = max_window_gap
+        self.ttl_seconds = ttl_seconds
         self.candidates = []
-        self.history_confirmed = []
 
     def update(self, raw_point, current_ts, window_id):
         """
         输入单帧检出的原始点坐标 raw_point: (x, y) or None
         返回: (status, confirmed_point, candidate_info, expired_log)
-        status:
-          - "CONFIRMED": 经过时序连续确认的真实故障
-          - "SUSPECT": 首次或正在观察中的疑似候选点 (暂不误报)
-          - "CLEARED": 本次无异物或误报已自动平息
         """
-        # 1. 先清理超时的候选点 (未持续命中的单帧瞬间误报)
+        # 1. 先清理超时与超跨度的候选点 (窗口步数保护 + 宽限挂钟保护)
         active_candidates = []
         expired_candidates = []
         for cand in self.candidates:
-            if (current_ts - cand.last_seen_ts) <= self.ttl:
+            window_gap = window_id - cand.last_window_id
+            time_gap = current_ts - cand.last_seen_ts
+            if window_gap <= self.max_window_gap and time_gap <= self.ttl_seconds:
                 active_candidates.append(cand)
             else:
                 expired_candidates.append(cand)
