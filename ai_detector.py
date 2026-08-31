@@ -232,8 +232,14 @@ class RTSPStreamSampler:
 
     def stop(self):
         self.running = False
+        if hasattr(self, 'thread') and self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.5)
         if self.cap:
-            self.cap.release()
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
 
 
 class PantographFaultDetector:

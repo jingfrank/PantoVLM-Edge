@@ -25,8 +25,11 @@ models/*
 *.tensorrt
 
 # Video test datasets & large media files
+弓网典型视频
 弓网典型视频/
 视频/
+test_results/
+benchmark_results/snapshots/
 *.mp4
 *.avi
 *.mkv

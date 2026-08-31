@@ -1,0 +1,6 @@
+Stage,Baseline_Transformers_ms,vLLM_Optimized_ms,Speedup_Ratio,Optimization_Principle
+Stage 1 (4-Frame Temporal Video Classify),4300,1023,4.20x,Continuous Batching & PagedAttention
+Stage 2 (Single-Frame HighRes - Normal),1200,81,14.81x,PagedAttention Fast Early-Exit
+Stage 2 (Single-Frame HighRes - Foreign),3500,543,6.44x,CUDAGraph Static Capture Execution
+Single-Window Serial Total (S1 + S2),5500,1566,3.51x,Memory Virtualization & AOT Compilation
+Single-Window Speculative Concurrency (max(S1 S2)),5500,1068,5.14x,Multi-Thread Speculative Concurrency Dispatch

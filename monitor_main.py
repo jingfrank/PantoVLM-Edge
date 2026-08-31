@@ -25,7 +25,6 @@ sys.path.insert(0, app_dir)
 sys.path.insert(0, src_dir)
 
 from ai_detector import PantographFaultDetector
-from twostage_vlm_engine import TwoStageVLMEngine
 from phm_service import create_monitor_phm_reporter
 from ftp_uploader import init_ftp_uploader
 
@@ -77,7 +76,16 @@ def main():
     vs_cfg = global_cfg.get("video_stream_config", {})
     streams = vs_cfg.get("streams", [])
 
-    shared_vlm_engine = TwoStageVLMEngine(global_cfg.get("base_algorithm_config", {}))
+    algo_cfg = global_cfg.get("base_algorithm_config", {})
+    engine_backend = algo_cfg.get("engine_backend", "vllm")
+    if engine_backend == "vllm":
+        from vllm_client_engine import TwoStageVLLMEngine
+        shared_vlm_engine = TwoStageVLLMEngine(algo_cfg)
+        print("[Engine] 🚀 正在使用 vLLM 高性能微服务推理后端")
+    else:
+        from twostage_vlm_engine import TwoStageVLMEngine
+        shared_vlm_engine = TwoStageVLMEngine(algo_cfg)
+        print("[Engine] 🐢 正在使用 Transformers 本地加载推理后端")
 
     for stream_cfg in streams:
         detector = PantographFaultDetector(global_cfg, stream_cfg, udp_sock, stop_event, vlm_engine=shared_vlm_engine)
