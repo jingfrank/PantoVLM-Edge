@@ -1,33 +1,37 @@
 # ==============================================================================
-# 受电弓网故障监测系统 - Jetson AGX Orin 边缘部署 Dockerfile (v2.0)
-# 基于 pantograph-subsystem-jetson:v1.0 增量升级 Python 3.10 与 Qwen3-VL 现代大模型依赖
+# 受电弓网故障监测系统 - Jetson AGX Orin 官方 vLLM 一体化完整镜像
+# 基础镜像: ghcr.io/nvidia-ai-iot/vllm:r36.4.tegra-aarch64-cu126-22.04
+# 内置环境: JetPack 6.x (r36.4) + CUDA 12.6 + PyTorch + Jetson 适配版 vLLM
+# 内置模型: Qwen3-VL-4B-Instruct-AWQ-4bit
 # ==============================================================================
 
-FROM pantograph-subsystem-jetson:v1.0
+FROM ghcr.io/nvidia-ai-iot/vllm:r36.4.tegra-aarch64-cu126-22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Shanghai
 ENV PYTHONUNBUFFERED=1
-
-# 1. 下载并安装 Standalone Python 3.10 (ARM64 aarch64 纯净运行时)
-RUN python3 -c "import urllib.request; urllib.request.urlretrieve('https://ghproxy.net/https://github.com/astral-sh/python-build-standalone/releases/download/20250115/cpython-3.10.16+20250115-aarch64-unknown-linux-gnu-install_only.tar.gz', '/tmp/python.tar.gz')" && \
-    mkdir -p /opt/python310 && \
-    tar -xzf /tmp/python.tar.gz -C /opt/python310 --strip-components=1 && \
-    rm /tmp/python.tar.gz
-
-# 2. 安装现代 PyTorch 与 Qwen3-VL 依赖 (配置国内清华镜像源主通道 + PyTorch CPU aarch64 扩展源，设置长超时保护)
-RUN /opt/python310/bin/pip install --no-cache-dir --default-timeout=1000 \
-        -i https://pypi.tuna.tsinghua.edu.cn/simple \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
-        torch torchvision && \
-    /opt/python310/bin/pip install --no-cache-dir --default-timeout=1000 \
-        -i https://pypi.tuna.tsinghua.edu.cn/simple \
-        "transformers>=4.57.0" accelerate ultralytics opencv-python-headless openpyxl Pillow pyyaml
-
-# 3. 设置系统默认 Python 为 Python 3.10
-ENV PATH="/opt/python310/bin:$PATH"
+ENV VLLM_MODEL_PATH=/app/models/Qwen3-VL-4B-Instruct-AWQ-4bit
+ENV VLLM_MODEL_NAME=Qwen3-VL-4B-Instruct
+ENV VLLM_GPU_MEMORY=0.8
+ENV VLLM_MAX_MODEL_LEN=4096
 
 WORKDIR /app
+
+# 1. 安装弓网监测业务 Python 依赖包 (复用容器内自带的 Jetson 优化版 PyTorch)
+RUN pip install --no-cache-dir \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    openpyxl \
+    pyyaml \
+    Pillow \
+    requests \
+    opencv-python-headless
+
+# 2. 复制预下载的 AWQ 4bit 大模型权重与源码
+COPY models/Qwen3-VL-4B-Instruct-AWQ-4bit /app/models/Qwen3-VL-4B-Instruct-AWQ-4bit
 COPY . /app
 
-CMD ["python3", "main.py", "config/config_prod.yaml"]
+# 3. 设置启动入口权限
+RUN chmod +x /app/deploy/orin/entrypoint.sh
+
+# 4. 容器入口
+ENTRYPOINT ["/app/deploy/orin/entrypoint.sh"]

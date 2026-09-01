@@ -1,12 +1,10 @@
-version: '3.8'
+version: "3.8"
 
 services:
-  gongwang_monitor:
-    image: pantograph-subsystem-jetson:v2.0
-    working_dir: /app
+  gongwang_monitor_vllm:
+    image: pantograph-vllm-orin:v1.0
     container_name: gongwang_monitor
     restart: always
-    command: python3 main.py config/config_prod.yaml
     runtime: nvidia
     network_mode: "host"
     environment:
@@ -14,14 +12,15 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=all
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
+      - VLLM_GPU_MEMORY=0.8
+      - VLLM_MAX_MODEL_LEN=4096
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
-      - /hirain/hi_opt/algo/gongwang_monitor:/app
       - /hirain/hi_opt/nvme1/Algo-result:/app/local_cache/Algo-result
+      - /hirain/hi_opt/algo/gongwang_monitor:/app
     logging:
       driver: "json-file"
       options:
         max-size: "100m"
         max-file: "3"
-
