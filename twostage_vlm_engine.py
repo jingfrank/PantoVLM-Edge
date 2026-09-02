@@ -50,7 +50,7 @@ class TemporalConsistencyTracker:
     【时序一致性追踪器】
     管理异物候选点生命周期，过滤单帧偶发误报，确认持续性真阳性故障。
     """
-    def __init__(self, match_dist=80.0, confirm_thresh=2, ttl=6.0):
+    def __init__(self, match_dist=80.0, confirm_thresh=2, ttl=30.0):
         self.match_dist = match_dist
         self.confirm_thresh = confirm_thresh
         self.ttl = ttl
@@ -80,11 +80,9 @@ class TemporalConsistencyTracker:
             if not exp.is_confirmed:
                 expired_log.append(f"点 {exp.point} (仅命中 {exp.hit_count} 次)")
 
-        # 2. 如果本窗口无检出，立即清除候选。
-        # 这样“二次确认”必须来自相邻窗口的连续命中，不会出现
-        # “命中 -> 漏检一个窗口 -> 再命中”仍然确认的情况。
+        # 2. 本窗口无检出，不再一刀切清空候选，让候选靠 TTL 自然过期
+        #    这样真实异物即使偶尔漏检一个窗口，也不会前功尽弃
         if raw_point is None:
-            self.candidates.clear()
             return "CLEARED", None, None, expired_log
 
         # 3. 尝试与现有候选点进行空间邻近匹配
