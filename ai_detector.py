@@ -669,9 +669,11 @@ class PantographFaultDetector:
                     #    Stage2 异物需在两个相邻的 4 秒窗口连续命中且点位接近才告警。
                     if len(self.window_buffer) == self.window_size:
                         self.window_count += 1
+                        t_infer_start = time.time()
                         vlm_res = self.vlm_engine.infer_window(
                             list(self.window_buffer), timestamp=current_ts
                         )
+                        t_infer_end = time.time()
 
                         # 更新内部状态
                         self.spark_alarmed = bool(vlm_res.get("spk", 0))
@@ -705,6 +707,13 @@ class PantographFaultDetector:
 
                         print(
                             f"\n⚡ ===== [AI-CAR{self.car_number}-CAM{self.camera_id}] [时序窗口 #{self.window_count}] Stage 1 & Stage 2 动静分离诊断 ====="
+                        )
+                        # 实时延迟监控计算
+                        lag_sec = t_infer_end - current_ts
+                        queue_backlog = sampler.frame_queue.qsize() if sampler else 0
+                        lag_warn = " ⚠️ [高滞后警告: 大模型处理速度低于推流速度，正在处理历史积压画面!]" if lag_sec > 3.0 else " ✅ [实时同步中]"
+                        print(
+                            f"  ⏱️ [流时延监控] 帧采集时标: {datetime.datetime.fromtimestamp(current_ts).strftime('%H:%M:%S.%f')[:-3]} | 当前现实时钟: {datetime.datetime.fromtimestamp(t_infer_end).strftime('%H:%M:%S.%f')[:-3]} | 真实时延差: {lag_sec:.2f}s (队列积压: {queue_backlog} 帧){lag_warn}"
                         )
                         print(
                             f"  ├─ S1 (视频流) 耗时: {vlm_res.get('s1_ms', 0):.0f} ms | 推理: {vlm_res.get('reasoning', '')}"
