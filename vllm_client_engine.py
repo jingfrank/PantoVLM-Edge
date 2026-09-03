@@ -13,6 +13,8 @@ vLLM 高性能客户端推理引擎 (vllm_client_engine.py)
 - 返回字段与 twostage_vlm_engine.py 100% 对齐，兼容 ai_detector.py
 """
 
+import os
+import tempfile
 import time
 import json
 import re
@@ -163,10 +165,11 @@ class TwoStageVLLMEngine:
         # 时序一致性追踪器（与 twostage_vlm_engine.py 完全相同的参数）
         confirm_hits = algo_cfg.get("foreign_confirm_hits", 2)
         match_dist = algo_cfg.get("foreign_match_dist", 80.0)
-        ttl = algo_cfg.get("foreign_candidate_ttl", 6.0)
+        ttl = algo_cfg.get("foreign_candidate_ttl", 30.0)
         self.tracker = TemporalConsistencyTracker(
             match_dist=match_dist, confirm_thresh=confirm_hits, ttl=ttl
         )
+        self.video_fps = float(algo_cfg.get("video_fps", 2.0))
 
         self._wait_for_server_ready()
 
@@ -196,7 +199,63 @@ class TwoStageVLLMEngine:
         b64_str = base64.b64encode(buf).decode("utf-8")
         return f"data:image/jpeg;base64,{b64_str}"
 
-    def _call_vllm_chat(self, messages, max_tokens=128, temperature=0.01):
+    def _frames_to_video_base64_url(self, frames_bgr, fps=2.0, max_side=640):
+        """将多帧 BGR 图像序列快速压制为内存 Base64 格式的 MP4 视频 Data URL"""
+        if not frames_bgr:
+            raise ValueError("帧列表为空")
+        h, w = frames_bgr[0].shape[:2]
+        if max(h, w) > max_side:
+            scale = max_side / max(h, w)
+            target_w = int(w * scale)
+            target_h = int(h * scale)
+            # 确保宽高为偶数，避免 MPEG-4 编码器因非偶数尺寸报错
+            target_w = target_w if target_w % 2 == 0 else target_w - 1
+            target_h = target_h if target_h % 2 == 0 else target_h - 1
+            resized_frames = [cv2.resize(f, (target_w, target_h)) for f in frames_bgr]
+        else:
+            target_w = w if w % 2 == 0 else w - 1
+            target_h = h if h % 2 == 0 else h - 1
+            if target_w != w or target_h != h:
+                resized_frames = [cv2.resize(f, (target_w, target_h)) for f in frames_bgr]
+            else:
+                resized_frames = frames_bgr
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(tmp_path, fourcc, float(fps), (target_w, target_h))
+            for f in resized_frames:
+                writer.write(f)
+            writer.release()
+
+            with open(tmp_path, "rb") as vf:
+                b64_video = base64.b64encode(vf.read()).decode("utf-8")
+            return f"data:video/mp4;base64,{b64_video}"
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def _build_video_messages(self, frames_bgr, prompt, fps=2.0, max_side=640):
+        """将多帧 BGR 图像序列封装为官方标准的 video_url 消息格式"""
+        video_data_url = self._frames_to_video_base64_url(frames_bgr, fps=fps, max_side=max_side)
+        content_items = [
+            {
+                "type": "video_url",
+                "video_url": {"url": video_data_url}
+            },
+            {
+                "type": "text",
+                "text": prompt
+            }
+        ]
+        return [{"role": "user", "content": content_items}]
+
+    def _call_vllm_chat(self, messages, max_tokens=128, temperature=0.01, mm_processor_kwargs=None):
         """调用 vLLM OpenAI Chat Completions API"""
         url = f"{self.api_base}/chat/completions"
         payload = {
@@ -205,6 +264,11 @@ class TwoStageVLLMEngine:
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        if mm_processor_kwargs is not None:
+            # 兼容标准 OpenAI 客户端 extra_body 传参格式与根目录字段传参
+            payload["mm_processor_kwargs"] = mm_processor_kwargs
+            payload["extra_body"] = {"mm_processor_kwargs": mm_processor_kwargs}
+
         resp = self.session.post(url, json=payload, timeout=30.0)
         resp.raise_for_status()
         data = resp.json()
@@ -233,12 +297,25 @@ class TwoStageVLLMEngine:
 
         self.window_id += 1
 
-        # ================= Stage 1: 火花 & 脏污全局分类 =================
+        # ================= Stage 1: 火花 & 脏污全局分类 (原生 video_url) =================
         t0 = time.time()
-        messages_s1 = self._build_image_messages(
-            frames_bgr_list, PROMPT_STAGE1, max_side=640, quality=75
-        )
-        s1_text = self._call_vllm_chat(messages_s1, max_tokens=128)
+        try:
+            messages_s1 = self._build_video_messages(
+                frames_bgr_list, PROMPT_STAGE1, fps=self.video_fps, max_side=640
+            )
+            s1_text = self._call_vllm_chat(
+                messages_s1,
+                max_tokens=128,
+                mm_processor_kwargs={"fps": self.video_fps, "do_sample_frames": False}
+            )
+        except Exception as e:
+            # 优雅降级：若特定容器未配置视频解码器，平滑切换回多图模式
+            print(f"⚠️ [vLLM客户端] video_url 推理异常 ({e})，自动回退多图 (image_url) 模式...", flush=True)
+            messages_s1 = self._build_image_messages(
+                frames_bgr_list, PROMPT_STAGE1, max_side=640, quality=75
+            )
+            s1_text = self._call_vllm_chat(messages_s1, max_tokens=128)
+
         s1_ms = int((time.time() - t0) * 1000)
 
         spk, dirt, reasoning = 0, 0, ""
@@ -269,12 +346,22 @@ class TwoStageVLLMEngine:
             s2_text = "Skipped (极度脏污短路保护)"
 
         elif spk == 1:
-            # 分支 2: 火花 <box> 定位（送所有帧，640p）
+            # 分支 2: 火花 <box> 定位（送 4 帧视频定位火花时空位置）
             t0 = time.time()
-            messages_s2 = self._build_image_messages(
-                frames_bgr_list, PROMPT_STAGE2_SPARK, max_side=640, quality=80
-            )
-            s2_text = self._call_vllm_chat(messages_s2, max_tokens=128)
+            try:
+                messages_s2 = self._build_video_messages(
+                    frames_bgr_list, PROMPT_STAGE2_SPARK, fps=self.video_fps, max_side=640
+                )
+                s2_text = self._call_vllm_chat(
+                    messages_s2,
+                    max_tokens=128,
+                    mm_processor_kwargs={"fps": self.video_fps, "do_sample_frames": False}
+                )
+            except Exception as e:
+                messages_s2 = self._build_image_messages(
+                    frames_bgr_list, PROMPT_STAGE2_SPARK, max_side=640, quality=80
+                )
+                s2_text = self._call_vllm_chat(messages_s2, max_tokens=128)
             s2_ms = int((time.time() - t0) * 1000)
 
             box_match = re.search(
