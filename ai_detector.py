@@ -176,45 +176,115 @@ class RTSPStreamSampler:
         self.sample_interval = sample_interval
         self.is_file = is_file
         self.running = False
+        self.is_connected = False
+        self.last_frame_time = 0.0
         self.cap = None
         self.frame_queue = queue.Queue(maxsize=30)
         self.last_sample_time = 0.0
+        self.thread = None
+        self._lock = threading.Lock()
 
     def start(self):
         self.running = True
+        self.is_connected = True
+        self.last_frame_time = time.time()
+
+        # 优化 RTSP 网络传输协议与超时控制，防止 UDP 乱序坏帧及无限阻塞
+        if not self.is_file and str(self.source_url).startswith(("rtsp://", "rtsps://")):
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;3000000|max_delay;500000"
+
         self.cap = cv2.VideoCapture(self.source_url)
+        if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+            self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+
         if not self.cap.isOpened():
+            self.is_connected = False
+            self.running = False
+            with self._lock:
+                if self.cap:
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
             raise RuntimeError(f"无法打开视频源: {self.source_url}")
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
+        return self
 
     def _worker(self):
-        fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
+        fps = 25.0
+        try:
+            with self._lock:
+                if self.cap:
+                    fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
+        except Exception:
+            pass
+
         frame_delay = 1.0 / fps if self.is_file else 0.001
         frame_count = 0
+        consecutive_read_fails = 0
+        max_read_fails = 5  # 连续读取失败上限（约 2.5~5 秒无任何新帧）
 
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret or frame is None:
-                if self.is_file:
-                    self.frame_queue.put(None)
+        try:
+            while self.running:
+                with self._lock:
+                    if not self.running or self.cap is None:
+                        break
+                    cap = self.cap
+                ret, frame = cap.read()
+                if not self.running:
                     break
-                else:
-                    time.sleep(1.0)
-                    continue
 
-            now = time.time()
-            if self.is_file:
-                sample_stride = max(1, int(round(fps * self.sample_interval)))
-                if frame_count % sample_stride == 0:
-                    self._push_frame(frame, now)
-                frame_count += 1
-                time.sleep(frame_delay)
-            else:
-                if (now - self.last_sample_time) >= self.sample_interval:
-                    self._push_frame(frame, now)
-                    self.last_sample_time = now
-                time.sleep(frame_delay)
+                if not ret or frame is None:
+                    if self.is_file:
+                        self.frame_queue.put(None)
+                        break
+                    else:
+                        consecutive_read_fails += 1
+                        now = time.time()
+                        # 网络流断流判定：连续读取失败超过上限或已超过 6 秒未收到有效帧
+                        if consecutive_read_fails >= max_read_fails or (now - self.last_frame_time > 6.0):
+                            print(
+                                f"[AI-Stream] 视频源异常断流 (连续读取失败 {consecutive_read_fails} 次, "
+                                f"静默时长 {now - self.last_frame_time:.1f}s)，采样线程退出并标记断开。",
+                                flush=True,
+                            )
+                            self.is_connected = False
+                            self.frame_queue.put(None)
+                            break
+                        time.sleep(0.5)
+                        continue
+
+                consecutive_read_fails = 0
+                now = time.time()
+                self.last_frame_time = now
+
+                if self.is_file:
+                    sample_stride = max(1, int(round(fps * self.sample_interval)))
+                    if frame_count % sample_stride == 0:
+                        self._push_frame(frame, now)
+                    frame_count += 1
+                    time.sleep(frame_delay)
+                else:
+                    if (now - self.last_sample_time) >= self.sample_interval:
+                        self._push_frame(frame, now)
+                        self.last_sample_time = now
+                    time.sleep(frame_delay)
+        except Exception as e:
+            print(f"[AI-Stream] 采样异常: {e}", flush=True)
+        finally:
+            self.is_connected = False
+            self.running = False
+            with self._lock:
+                if self.cap:
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
 
     def _push_frame(self, frame, timestamp):
         if self.frame_queue.full():
@@ -230,16 +300,25 @@ class RTSPStreamSampler:
         except queue.Empty:
             return None
 
+    def is_alive(self):
+        return (
+            self.running
+            and self.is_connected
+            and (self.thread is not None and self.thread.is_alive())
+        )
+
     def stop(self):
         self.running = False
+        self.is_connected = False
         if hasattr(self, 'thread') and self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1.5)
-        if self.cap:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-            self.cap = None
+            self.thread.join(timeout=3.5)
+        with self._lock:
+            if self.cap:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
 
 
 class PantographFaultDetector:
@@ -306,6 +385,7 @@ class PantographFaultDetector:
         self.window_buffer = deque(maxlen=self.window_size)
         self.window_count = 0
         self.last_sample_ts = 0.0
+        self.last_frame_ts = 0.0
         self._current_vlm_res = {}
 
         self.ftp_remote_dir = stream_cfg.get(
@@ -314,6 +394,36 @@ class PantographFaultDetector:
                 "monitor_remote_dir", "/hirain/hi_opt/nvme1/Algo-result"
             ),
         )
+
+    def reset_alarm_states(self):
+        """重置所有故障报警标志，清空窗口缓存，防止断流或异常期间旧告警在 PHM 或网络中驻留虚警"""
+        self.spark_alarmed = False
+        self.structure_alarmed = False
+        self.dirty_alarmed = False
+        self.tilt_alarmed = False
+        self.foreign_alarmed = False
+        self.float_alarmed = False
+        self._last_spark_alarmed = False
+        self._last_foreign_alarmed = False
+        self._last_dirty_alarmed = False
+        self._last_structure_alarmed = False
+        self._last_tilt_alarmed = False
+        self._last_float_alarmed = False
+        self.spark_duration = 0
+        self.foreign_frames = 0
+        self.structure_abnormal_cnt = 0
+        self.tilt_abnormal_cnt = 0
+        self.float_abnormal_cnt = 0
+        self.window_buffer.clear()
+        self._current_vlm_res = {}
+
+    def is_streaming_active(self):
+        """判断当前视频流是否处于正常活跃接收状态（超过 6 秒未收到有效帧判定为流中断）"""
+        if self.stop_event.is_set():
+            return False
+        if getattr(self, "last_frame_ts", 0.0) <= 0:
+            return False
+        return (time.time() - self.last_frame_ts) <= 6.0
 
     def _ftp_upload_local_file(self, local_path):
         from ftp_uploader import get_ftp_uploader
@@ -394,11 +504,11 @@ class PantographFaultDetector:
             if rec["fault_time"] < current_ts <= rec["end_time"]:
                 rec["post_frames"].append(jpeg_buf)
 
-    def finalize_completed_recordings(self):
+    def finalize_completed_recordings(self, force=False):
         still_pending = []
         current_time = time.time()
         for rec in self.pending_recordings:
-            if current_time >= rec["end_time"]:
+            if force or current_time >= rec["end_time"]:
                 all_frames = rec["pre_frames"] + rec["post_frames"]
                 if all_frames:
                     try:
@@ -417,12 +527,11 @@ class PantographFaultDetector:
                         )
                         target_fps = float(max(1.0, min(60.0, calc_fps)))
 
-                        # 使用标准的 H.264 编码 (avc1) 提升播放流畅度与浏览器/播放器兼容性
-                        fourcc = cv2.VideoWriter_fourcc(*"avc1")
+                        # 优先使用通用 mp4v 编码，规避 Docker/Jetson 缺少 v4l2 硬件设备导致的 h264_v4l2m2m 报错
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                         out = cv2.VideoWriter(video_path, fourcc, target_fps, (w, h))
                         if not out.isOpened():
-                            # 回退至 mp4v 编码
-                            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                            fourcc = cv2.VideoWriter_fourcc(*"avc1")
                             out = cv2.VideoWriter(
                                 video_path, fourcc, target_fps, (w, h)
                             )
@@ -639,7 +748,13 @@ class PantographFaultDetector:
     def run(self):
         while not self.stop_event.is_set():
             sampler = None
+            consecutive_timeouts = 0
+            max_consecutive_timeouts = 2  # 连续 2 次采样超时（约 10s 无帧）判定断流触发重连
+
             try:
+                # 建立连接或重连前，强制复位所有故障标志位，防止断流期间旧告警持续驻留
+                self.reset_alarm_states()
+
                 is_file = os.path.exists(self.rtsp_url) or (
                     not self.rtsp_url.startswith("rtsp://") and not self.rtsp_url.startswith("http://")
                 )
@@ -658,8 +773,23 @@ class PantographFaultDetector:
                             print(
                                 f"[AI-CAR{self.car_number}-CAM{self.camera_id}] 测试视频已读取完毕。"
                             )
-                            break
+                            return
+
+                        # 实时网络流超时处理
+                        consecutive_timeouts += 1
+                        # 只要未收到新帧，立即复位报警状态，杜绝断流期间持续误报/虚警滞留
+                        self.reset_alarm_states()
+
+                        if not sampler.is_alive() or consecutive_timeouts >= max_consecutive_timeouts:
+                            raise RuntimeError(
+                                f"视频源异常断流或长时间未收到帧 (连续超时 {consecutive_timeouts} 次, "
+                                f"采样器状态: is_alive={sampler.is_alive()})"
+                            )
                         continue
+
+                    # 成功获取到帧，清零超时计数并更新时标
+                    consecutive_timeouts = 0
+                    self.last_frame_ts = time.time()
 
                     raw_frame, current_ts = item
                     self.frame_count += 1
@@ -880,10 +1010,21 @@ class PantographFaultDetector:
             except Exception as e:
                 if self.stop_event.is_set():
                     break
+                self.reset_alarm_states()
+                self.finalize_completed_recordings(force=True)
+                if sampler:
+                    try:
+                        sampler.stop()
+                    except Exception:
+                        pass
+                    sampler = None
                 print(
                     f"[AI-CAR{self.car_number}-CAM{self.camera_id}] 视频流处理异常: {e}，5秒后自动重连..."
                 )
                 time.sleep(5)
             finally:
                 if sampler:
-                    sampler.stop()
+                    try:
+                        sampler.stop()
+                    except Exception:
+                        pass
