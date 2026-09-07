@@ -170,6 +170,7 @@ class TwoStageVLLMEngine:
             match_dist=match_dist, confirm_thresh=confirm_hits, ttl=ttl
         )
         self.video_fps = float(algo_cfg.get("video_fps", 2.0))
+        self.video_max_side = int(algo_cfg.get("video_max_side", 960))
 
         self._wait_for_server_ready()
 
@@ -207,7 +208,7 @@ class TwoStageVLLMEngine:
         b64_str = base64.b64encode(buf).decode("utf-8")
         return f"data:image/png;base64,{b64_str}"
 
-    def _frames_to_video_base64_url(self, frames_bgr, fps=2.0, max_side=640):
+    def _frames_to_video_base64_url(self, frames_bgr, fps=2.0, max_side=960):
         """将多帧 BGR 图像序列快速压制为内存 Base64 格式的 MP4 视频 Data URL"""
         if not frames_bgr:
             raise ValueError("帧列表为空")
@@ -248,7 +249,7 @@ class TwoStageVLLMEngine:
                 except OSError:
                     pass
 
-    def _build_video_messages(self, frames_bgr, prompt, fps=2.0, max_side=640):
+    def _build_video_messages(self, frames_bgr, prompt, fps=2.0, max_side=960):
         """将多帧 BGR 图像序列封装为官方标准的 video_url 消息格式"""
         video_data_url = self._frames_to_video_base64_url(frames_bgr, fps=fps, max_side=max_side)
         content_items = [
@@ -282,7 +283,7 @@ class TwoStageVLLMEngine:
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
 
-    def _build_image_messages(self, frames_bgr, prompt, max_side=640, quality=75):
+    def _build_image_messages(self, frames_bgr, prompt, max_side=960, quality=75):
         """将多帧 BGR 图像 + prompt 构建为 OpenAI messages 格式"""
         content_items = []
         for f in frames_bgr:
@@ -318,7 +319,7 @@ class TwoStageVLLMEngine:
         t0 = time.time()
         try:
             messages_s1 = self._build_video_messages(
-                frames_bgr_list, PROMPT_STAGE1, fps=self.video_fps, max_side=640
+                frames_bgr_list, PROMPT_STAGE1, fps=self.video_fps, max_side=self.video_max_side
             )
             s1_text = self._call_vllm_chat(
                 messages_s1,
@@ -329,7 +330,7 @@ class TwoStageVLLMEngine:
             # 优雅降级：若特定容器未配置视频解码器，平滑切换回多图模式
             print(f"⚠️ [vLLM客户端] video_url 推理异常 ({e})，自动回退多图 (image_url) 模式...", flush=True)
             messages_s1 = self._build_image_messages(
-                frames_bgr_list, PROMPT_STAGE1, max_side=640, quality=75
+                frames_bgr_list, PROMPT_STAGE1, max_side=self.video_max_side, quality=75
             )
             s1_text = self._call_vllm_chat(messages_s1, max_tokens=128)
 
@@ -367,7 +368,7 @@ class TwoStageVLLMEngine:
             t0 = time.time()
             try:
                 messages_s2 = self._build_video_messages(
-                    frames_bgr_list, PROMPT_STAGE2_SPARK, fps=self.video_fps, max_side=640
+                    frames_bgr_list, PROMPT_STAGE2_SPARK, fps=self.video_fps, max_side=self.video_max_side
                 )
                 s2_text = self._call_vllm_chat(
                     messages_s2,
@@ -376,7 +377,7 @@ class TwoStageVLLMEngine:
                 )
             except Exception as e:
                 messages_s2 = self._build_image_messages(
-                    frames_bgr_list, PROMPT_STAGE2_SPARK, max_side=640, quality=80
+                    frames_bgr_list, PROMPT_STAGE2_SPARK, max_side=self.video_max_side, quality=80
                 )
                 s2_text = self._call_vllm_chat(messages_s2, max_tokens=128)
             s2_ms = int((time.time() - t0) * 1000)
@@ -398,7 +399,7 @@ class TwoStageVLLMEngine:
             t0 = time.time()
             try:
                 messages_s2 = self._build_video_messages(
-                    frames_bgr_list, PROMPT_STAGE2_FOREIGN, fps=self.video_fps, max_side=640
+                    frames_bgr_list, PROMPT_STAGE2_FOREIGN, fps=self.video_fps, max_side=self.video_max_side
                 )
                 s2_text = self._call_vllm_chat(
                     messages_s2,
@@ -409,7 +410,7 @@ class TwoStageVLLMEngine:
             except Exception as e:
                 # 优雅降级：若视频解码失败，回退到多图模式
                 messages_s2 = self._build_image_messages(
-                    frames_bgr_list, PROMPT_STAGE2_FOREIGN, max_side=640, quality=85
+                    frames_bgr_list, PROMPT_STAGE2_FOREIGN, max_side=self.video_max_side, quality=85
                 )
                 s2_text = self._call_vllm_chat(messages_s2, max_tokens=256, temperature=0.0)
             s2_ms = int((time.time() - t0) * 1000)
