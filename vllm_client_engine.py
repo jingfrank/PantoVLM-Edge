@@ -199,6 +199,14 @@ class TwoStageVLLMEngine:
         b64_str = base64.b64encode(buf).decode("utf-8")
         return f"data:image/jpeg;base64,{b64_str}"
 
+    def _frame_to_png_base64_url(self, frame_bgr):
+        """将 BGR 图像直接无损编码为 PNG Base64 Data URL，彻底消除 JPEG 压缩噪点与振铃伪影"""
+        ret, buf = cv2.imencode(".png", frame_bgr)
+        if not ret:
+            raise ValueError("图像 PNG 编码失败")
+        b64_str = base64.b64encode(buf).decode("utf-8")
+        return f"data:image/png;base64,{b64_str}"
+
     def _frames_to_video_base64_url(self, frames_bgr, fps=2.0, max_side=640):
         """将多帧 BGR 图像序列快速压制为内存 Base64 格式的 MP4 视频 Data URL"""
         if not frames_bgr:
@@ -255,8 +263,8 @@ class TwoStageVLLMEngine:
         ]
         return [{"role": "user", "content": content_items}]
 
-    def _call_vllm_chat(self, messages, max_tokens=128, temperature=0.01, mm_processor_kwargs=None):
-        """调用 vLLM OpenAI Chat Completions API"""
+    def _call_vllm_chat(self, messages, max_tokens=128, temperature=0.0, mm_processor_kwargs=None):
+        """调用 vLLM OpenAI Chat Completions API (默认绝对贪婪解码 temperature=0.0)"""
         url = f"{self.api_base}/chat/completions"
         payload = {
             "model": self.model_name,
@@ -285,6 +293,15 @@ class TwoStageVLLMEngine:
             b64_url = self._frame_to_base64_url(f, quality=quality)
             content_items.append({"type": "image_url", "image_url": {"url": b64_url}})
         content_items.append({"type": "text", "text": prompt})
+        return [{"role": "user", "content": content_items}]
+
+    def _build_lossless_single_image_messages(self, frame_bgr, prompt):
+        """使用 100% 原始尺寸与无损 PNG 编码构建单图消息，不进行任何画质与分辨率压缩"""
+        b64_url = self._frame_to_png_base64_url(frame_bgr)
+        content_items = [
+            {"type": "image_url", "image_url": {"url": b64_url}},
+            {"type": "text", "text": prompt}
+        ]
         return [{"role": "user", "content": content_items}]
 
     def infer_window(self, frames_bgr_list, timestamp=None):
@@ -377,13 +394,13 @@ class TwoStageVLLMEngine:
                     box_coords = tuple(raw_coords)
 
         else:
-            # 分支 3: 悬挂异物 <point> 定位（仅最后一帧，960p 高清）
+            # 分支 3: 悬挂异物 <point> 定位（最后一帧 100% 原始尺寸高清无损原图，零画质压缩）
             last_frame = frames_bgr_list[-1]
             t0 = time.time()
-            messages_s2 = self._build_image_messages(
-                [last_frame], PROMPT_STAGE2_FOREIGN, max_side=960, quality=85
+            messages_s2 = self._build_lossless_single_image_messages(
+                last_frame, PROMPT_STAGE2_FOREIGN
             )
-            s2_text = self._call_vllm_chat(messages_s2, max_tokens=256)
+            s2_text = self._call_vllm_chat(messages_s2, max_tokens=256, temperature=0.0)
             s2_ms = int((time.time() - t0) * 1000)
 
             # 与 twostage_vlm_engine.py 完全相同的防误报过滤
