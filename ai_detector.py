@@ -820,13 +820,9 @@ class PantographFaultDetector:
                         if self.dirty_alarmed:
                             flags.append("🌫️ 画面脏污")
                         if self.foreign_alarmed:
-                            cand = vlm_res.get("temporal_cand")
-                            hit_cnt = cand.hit_count if cand else 2
-                            flags.append(f"🎯 悬挂异物 (时序已确认! 命中{hit_cnt}次)")
-                        elif vlm_res.get("temporal_status") == "SUSPECT":
-                            cand = vlm_res.get("temporal_cand")
-                            hit_cnt = cand.hit_count if cand else 1
-                            flags.append(f"⏳ 疑似异物 (时序观察中 命中{hit_cnt}/2次, 暂不虚警)")
+                            pt = vlm_res.get("point")
+                            pt_str = f" {pt}" if pt else ""
+                            flags.append(f"🎯 悬挂异物{pt_str}")
                         if self.structure_alarmed:
                             flags.append("⚠️ 结构异常")
                         if self.tilt_alarmed:

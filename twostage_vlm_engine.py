@@ -331,22 +331,18 @@ class TwoStageVLMEngine:
                 if not (coords[0] == 0 and coords[1] == 0):
                     raw_point = coords
 
-        # ================= 时序一致性滤波校验 =================
-        # 使用采集时间而不是 VLM 推理完成时间，避免推理耗时造成 TTL 判断漂移。
-        now = time.time() if timestamp is None else float(timestamp)
-        status, confirmed_pt, cand, expired_log = self.tracker.update(
-            raw_point, now, self.window_id
-        )
-
-        if status == "CONFIRMED":
+        # ================= 异物直接判定 (对齐 rtsp_twostage_vlm.py，无需二次确认) =================
+        if raw_point is not None:
             obj = 1
-            point_coords = confirmed_pt
-        elif status == "SUSPECT":
-            # 疑似观察中，点坐标供调试，但不触发正式故障告警
-            point_coords = cand.point if cand else raw_point
-            obj = 0
+            point_coords = raw_point
+            status = "CONFIRMED"
         else:
             obj = 0
+            point_coords = None
+            status = "CLEARED"
+
+        cand = None
+        expired_log = []
 
         return {
             "spk": spk,
