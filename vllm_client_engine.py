@@ -394,13 +394,24 @@ class TwoStageVLLMEngine:
                     box_coords = tuple(raw_coords)
 
         else:
-            # 分支 3: 悬挂异物 <point> 定位（最后一帧 100% 原始尺寸高清无损原图，零画质压缩）
-            last_frame = frames_bgr_list[-1]
+            # 分支 3: 悬挂异物 <point> 定位（两阶段统一采用 4 帧 video 视频流理解，对齐 rtsp_twostage_vlm.py）
             t0 = time.time()
-            messages_s2 = self._build_lossless_single_image_messages(
-                last_frame, PROMPT_STAGE2_FOREIGN
-            )
-            s2_text = self._call_vllm_chat(messages_s2, max_tokens=256, temperature=0.0)
+            try:
+                messages_s2 = self._build_video_messages(
+                    frames_bgr_list, PROMPT_STAGE2_FOREIGN, fps=self.video_fps, max_side=640
+                )
+                s2_text = self._call_vllm_chat(
+                    messages_s2,
+                    max_tokens=256,
+                    temperature=0.0,
+                    mm_processor_kwargs={"fps": self.video_fps, "do_sample_frames": False},
+                )
+            except Exception as e:
+                # 优雅降级：若视频解码失败，回退到多图模式
+                messages_s2 = self._build_image_messages(
+                    frames_bgr_list, PROMPT_STAGE2_FOREIGN, max_side=640, quality=85
+                )
+                s2_text = self._call_vllm_chat(messages_s2, max_tokens=256, temperature=0.0)
             s2_ms = int((time.time() - t0) * 1000)
 
             # 与 twostage_vlm_engine.py 完全相同的防误报过滤

@@ -317,9 +317,9 @@ class TwoStageVLMEngine:
                 if len(raw_coords) == 4:
                     box_coords = tuple(raw_coords)
         else:
-            # 🎯 最后一帧高清单图定位
-            s2_text, s2_ms = self._infer_single_image(
-                last_pil_frame, self.prompt_stage2_foreign, max_tokens=128
+            # 🎯 采用 4 帧视频时序定位 (两阶段统一采用 video 视频理解模式，对齐 rtsp_twostage_vlm.py)
+            s2_text, s2_ms = self._infer_video(
+                pil_frames, self.prompt_stage2_foreign, max_tokens=256
             )
             point_pattern1 = r"<point>\s*(\d+)\s*,\s*(\d+)\s*</point>"
             point_pattern2 = r"\((\d+)\s*,\s*(\d+)\)"
