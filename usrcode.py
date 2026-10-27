@@ -43,6 +43,11 @@ def build_monitor_result_values(detectors, fault_levels=None):
     camera_id = 0
 
     for detector in detectors:
+        # 如果检测器当前视频流处于非活跃或断流状态，忽略该检测器，防止旧故障驻留虚警
+        is_active = getattr(detector, "is_streaming_active", None)
+        if callable(is_active) and not is_active():
+            continue
+
         if car_number == 0:
             try:
                 car_number = int(getattr(detector, "car_number", 0) or 0)

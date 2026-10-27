@@ -16,6 +16,8 @@ events/
 # Large model files and weights
 models/*
 !models/.gitkeep
+models/Qwen*
+*Qwen*
 *.pt
 *.pth
 *.bin
@@ -23,6 +25,10 @@ models/*
 *.onnx
 *.engine
 *.tensorrt
+*.awq
+*.gptq
+*.gguf
+*.plan
 
 # Video test datasets & large media files
 弓网典型视频
