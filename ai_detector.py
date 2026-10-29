@@ -21,7 +21,7 @@ import datetime
 import threading
 import queue
 from collections import deque
-import datetime
+import psutil
 
 FAULT_TYPE_MAP = {
     "大火花": 3,
@@ -394,6 +394,102 @@ class PantographFaultDetector:
                 "monitor_remote_dir", "/hirain/hi_opt/nvme1/Algo-result"
             ),
         )
+
+        # 运行时性能基准统计器 (在线流模式压测指标自动采集)
+        self.perf_stats = {
+            "start_ts": time.time(),
+            "infer_latencies": [],
+            "e2e_latencies": [],
+            "s1_latencies": [],
+            "s2_latencies": [],
+            "backlogs": [],
+        }
+
+    def save_perf_report(self):
+        """保存并打印在线流处理性能基准评测报告 (供系统评测报告直接引用)"""
+        if not self.perf_stats["infer_latencies"]:
+            return
+
+        wall_time = max(0.001, time.time() - self.perf_stats["start_ts"])
+        total_eval_frames = self.window_count * 4
+        online_fps = total_eval_frames / wall_time
+        window_qps = self.window_count / wall_time
+
+        infer_arr = np.array(self.perf_stats["infer_latencies"])
+        e2e_arr = np.array(self.perf_stats["e2e_latencies"])
+        s1_arr = np.array(self.perf_stats["s1_latencies"]) if self.perf_stats["s1_latencies"] else np.array([0.0])
+        s2_arr = np.array(self.perf_stats["s2_latencies"]) if self.perf_stats["s2_latencies"] else np.array([0.0])
+        backlog_arr = np.array(self.perf_stats["backlogs"]) if self.perf_stats["backlogs"] else np.array([0])
+
+        avg_infer = float(np.mean(infer_arr))
+        p50_infer = float(np.percentile(infer_arr, 50))
+        p90_infer = float(np.percentile(infer_arr, 90))
+        p99_infer = float(np.percentile(infer_arr, 99))
+        std_infer = float(np.std(infer_arr))
+        single_frame_infer = avg_infer / 4.0
+
+        avg_e2e = float(np.mean(e2e_arr))
+        p90_e2e = float(np.percentile(e2e_arr, 90))
+        p99_e2e = float(np.percentile(e2e_arr, 99))
+        avg_s1 = float(np.mean(s1_arr))
+        avg_s2 = float(np.mean(s2_arr)) if len(self.perf_stats["s2_latencies"]) > 0 else 0.0
+
+        avg_backlog = float(np.mean(backlog_arr))
+        max_backlog = int(np.max(backlog_arr))
+
+        try:
+            peak_ram_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+        except Exception:
+            peak_ram_mb = 0.0
+
+        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_dir = self.global_cfg.get("benchmark_dir", "./benchmark_results")
+        os.makedirs(report_dir, exist_ok=True)
+        md_path = os.path.join(report_dir, f"online_benchmark_car{self.car_number}_cam{self.camera_id}_{now_str}.md")
+
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(f"# 动车组受电弓故障监测系统 - 在线视频流性能基准评测报告\n\n")
+            f.write(f"- **视频流地址**: `{self.rtsp_url}` (CAR{self.car_number}-CAM{self.camera_id})\n")
+            f.write(f"- **监测运行时长**: {wall_time:.1f} 秒 ({wall_time/60:.1f} 分钟)\n")
+            f.write(f"- **处理时序窗口总数**: {self.window_count} 个 (等效评测帧数: {total_eval_frames} 帧)\n")
+            f.write(f"- **报告生成时间**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("## 核心在线系统评测指标表 (Online Benchmark Scorecard)\n\n")
+            f.write("| 评测维度 | 指标项 | 评测实测值 | 性能判定与工程说明 |\n")
+            f.write("| :--- | :--- | :--- | :--- |\n")
+            f.write(f"| **处理延迟** | **平均单窗口纯推理耗时 (Mean)** | **{avg_infer:.2f} ms** | 4 帧动静分离级联诊断平均推理耗时 |\n")
+            f.write(f"| | **等效平均单帧推理耗时** | **{single_frame_infer:.2f} ms / 帧** | 均摊至每张输入图像的算法推理时延 |\n")
+            f.write(f"| | **中位数推理耗时 (P50)** | **{p50_infer:.2f} ms** | 50% 样本处于该时延以内 |\n")
+            f.write(f"| | **90分位推理耗时 (P90)** | **{p90_infer:.2f} ms** | 90% 样本处于该时延以内 |\n")
+            f.write(f"| | **99分位推理耗时 (P99)** | **{p99_infer:.2f} ms** | 长尾极限时延，衡量系统抗抖动能力 |\n")
+            f.write(f"| | **时延标准差 (Jitter Std)** | **{std_infer:.2f} ms** | 推理时间抖动度评估 |\n")
+            f.write(f"| | **全链路端到端真实时延差 (E2E Lag)** | **{avg_e2e:.2f} ms** (P99: {p99_e2e:.2f} ms) | 从网络取流时标到推理完成的全链路滞后 |\n")
+            f.write(f"| | Stage 1 (时序分类) 平均耗时 | {avg_s1:.2f} ms | 火花与脏污全局分类耗时 |\n")
+            f.write(f"| | Stage 2 (细粒度定位) 平均耗时 | {avg_s2:.2f} ms | 悬挂异物定位触发耗时 |\n")
+            f.write(f"| **吞吐能力** | **在线流式处理吞吐率 (FPS)** | **{online_fps:.2f} FPS** | 实际业务流帧率 (配置步长 1Hz采样) |\n")
+            f.write(f"| | **在线诊断吞吐率 (QPS)** | **{window_qps:.2f} Windows/s** | 每秒实际完成的时序窗口诊断数 |\n")
+            f.write(f"| | **采样队列积压量 (Queue Backlog)** | **均值 {avg_backlog:.1f} 帧 / 峰值 {max_backlog} 帧** | 积压接近 0 表示处理速度完全跟得上推流 |\n")
+            f.write(f"| **资源开销** | **主机物理内存峰值 (RAM RSS)** | **{peak_ram_mb:.2f} MB ({peak_ram_mb/1024:.2f} GB)** | 长期推流下常驻物理内存峰值 |\n")
+
+        print("\n" + "=" * 90)
+        print(f" 📊 [CAR{self.car_number}-CAM{self.camera_id}] 在线视频流性能测试看板 (Online Benchmark Summary)")
+        print("=" * 90)
+        print(f"• 监测总时长: {wall_time:.1f}s | 处理窗口数: {self.window_count} (等效帧数: {total_eval_frames})")
+        print(f"------------------------------------------------------------------------------------------")
+        print(f" [1] 延迟指标 (Latency)")
+        print(f"     - 平均单窗口纯推理耗时 (Mean) : {avg_infer:.2f} ms (单帧等效: {single_frame_infer:.2f} ms)")
+        print(f"     - 中位数 (P50) / 90分位 (P90): {p50_infer:.2f} ms / {p90_infer:.2f} ms")
+        print(f"     - 99分位长尾时延 (P99)      : {p99_infer:.2f} ms (标准差: {std_infer:.2f} ms)")
+        print(f"     - 全链路端到端真实滞后 (E2E) : 均值 {avg_e2e:.1f} ms | 峰值 P99 {p99_e2e:.1f} ms")
+        print(f"------------------------------------------------------------------------------------------")
+        print(f" [2] 吞吐与队列状态 (Throughput & Queue)")
+        print(f"     - 在线处理吞吐率 (FPS)      : {online_fps:.2f} FPS")
+        print(f"     - 队列积压状况 (Backlog)    : 均值 {avg_backlog:.1f} 帧 | 峰值 {max_backlog} 帧")
+        print(f"------------------------------------------------------------------------------------------")
+        print(f" [3] 资源占用 (Resources)")
+        print(f"     - 主机物理内存峰值 (RSS)   : {peak_ram_mb:.2f} MB ({peak_ram_mb/1024:.2f} GB)")
+        print(f"------------------------------------------------------------------------------------------")
+        print(f"📝 在线性能报告已落盘至: {md_path}")
+        print("=" * 90 + "\n", flush=True)
 
     def reset_alarm_states(self):
         """重置所有故障报警标志，清空窗口缓存，防止断流或异常期间旧告警在 PHM 或网络中驻留虚警"""
@@ -834,10 +930,19 @@ class PantographFaultDetector:
                         print(
                             f"\n⚡ ===== [AI-CAR{self.car_number}-CAM{self.camera_id}] [时序窗口 #{self.window_count}] Stage 1 & Stage 2 动静分离诊断 ====="
                         )
-                        # 实时延迟监控计算
+                        # 实时延迟监控计算与性能统计指标收集
                         lag_sec = t_infer_end - current_ts
                         queue_backlog = sampler.frame_queue.qsize() if sampler else 0
                         lag_warn = " ⚠️ [高滞后警告: 大模型处理速度低于推流速度，正在处理历史积压画面!]" if lag_sec > 3.0 else " ✅ [实时同步中]"
+
+                        infer_ms = (t_infer_end - t_infer_start) * 1000.0
+                        e2e_ms = max(0.0, lag_sec * 1000.0)
+                        self.perf_stats["infer_latencies"].append(infer_ms)
+                        self.perf_stats["e2e_latencies"].append(e2e_ms)
+                        self.perf_stats["s1_latencies"].append(vlm_res.get("s1_ms", 0))
+                        if vlm_res.get("s2_ms", 0) > 0:
+                            self.perf_stats["s2_latencies"].append(vlm_res["s2_ms"])
+                        self.perf_stats["backlogs"].append(queue_backlog)
                         print(
                             f"  ⏱️ [流时延监控] 帧采集时标: {datetime.datetime.fromtimestamp(current_ts).strftime('%H:%M:%S.%f')[:-3]} | 当前现实时钟: {datetime.datetime.fromtimestamp(t_infer_end).strftime('%H:%M:%S.%f')[:-3]} | 真实时延差: {lag_sec:.2f}s (队列积压: {queue_backlog} 帧){lag_warn}"
                         )
@@ -1024,3 +1129,9 @@ class PantographFaultDetector:
                         sampler.stop()
                     except Exception:
                         pass
+
+        # 退出监测循环，落盘在线性能评测报告
+        try:
+            self.save_perf_report()
+        except Exception as e:
+            print(f"[AI-CAR{self.car_number}-CAM{self.camera_id}] 保存在线性能评测报告异常: {e}")

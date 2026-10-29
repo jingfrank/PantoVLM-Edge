@@ -114,6 +114,8 @@ def main():
     finally:
         print("\n[监测服务] 正在关闭 AI 识别引擎...")
         stop_event.set()
+        for t in ai_threads:
+            t.join(timeout=3.0)
         if phm_reporter:
             phm_reporter.stop()
         udp_sock.close()

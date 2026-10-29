@@ -20,6 +20,12 @@ import datetime
 import cv2
 import argparse
 import numpy as np
+import psutil
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from vllm_client_engine import TwoStageVLLMEngine
 
 
@@ -120,6 +126,18 @@ def run_full_test(video_path, max_duration=None, output_dir="./test_results"):
     fault_event_count = 0
     records = []
     total_latency_ms_list = []
+    s1_latency_ms_list = []
+    s2_latency_ms_list = []
+
+    process = psutil.Process(os.getpid())
+    initial_ram_mb = process.memory_info().rss / (1024 * 1024)
+    peak_ram_mb = initial_ram_mb
+
+    if torch and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        initial_vram_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+    else:
+        initial_vram_mb = 0.0
 
     print(f"{'时间':^8} | {'窗口':^6} | {'S1耗时':^8} | {'S2耗时':^8} | {'总耗时':^8} | {'总体诊断结论':<24} | {'定位坐标':^16}")
     print("-" * 95)
@@ -146,12 +164,23 @@ def run_full_test(video_path, max_duration=None, output_dir="./test_results"):
                 current_window_frames = [f for f in window_buffer]
                 window_buffer.clear()
 
-                total_latency_ms_list.append(res["total_latency_ms"])
+                tot_ms = res["total_latency_ms"]
+                s1_ms = res["stage1_latency_ms"]
+                s2_ms = res["stage2_latency_ms"]
+
+                total_latency_ms_list.append(tot_ms)
+                s1_latency_ms_list.append(s1_ms)
+                if s2_ms > 0:
+                    s2_latency_ms_list.append(s2_ms)
+
+                cur_ram = process.memory_info().rss / (1024 * 1024)
+                if cur_ram > peak_ram_mb:
+                    peak_ram_mb = cur_ram
 
                 time_str = f"{int(current_sec//60):02d}:{int(current_sec%60):02d}"
-                s1_time = f"{res['stage1_latency_ms']}ms"
-                s2_time = f"{res['stage2_latency_ms']}ms" if res['stage2_latency_ms'] > 0 else "跳过"
-                tot_time = f"{res['total_latency_ms']}ms"
+                s1_time = f"{s1_ms}ms"
+                s2_time = f"{s2_ms}ms" if s2_ms > 0 else "跳过"
+                tot_time = f"{tot_ms}ms"
 
                 status_str = res["status_str"]
                 has_fault = (res["spk"] == 1 or res["dirt"] == 1 or res["obj"] == 1)
@@ -178,9 +207,9 @@ def run_full_test(video_path, max_duration=None, output_dir="./test_results"):
                     "window_id": window_count,
                     "time_str": time_str,
                     "current_sec": round(current_sec, 2),
-                    "s1_latency_ms": res["stage1_latency_ms"],
-                    "s2_latency_ms": res["stage2_latency_ms"],
-                    "total_latency_ms": res["total_latency_ms"],
+                    "s1_latency_ms": s1_ms,
+                    "s2_latency_ms": s2_ms,
+                    "total_latency_ms": tot_ms,
                     "spk": res["spk"],
                     "dirt": res["dirt"],
                     "foreign_obj": res["obj"],
@@ -207,20 +236,63 @@ def run_full_test(video_path, max_duration=None, output_dir="./test_results"):
         writer.writeheader()
         writer.writerows(records)
 
-    # 2. 写入 Markdown 汇总报告
-    avg_lat = np.mean(total_latency_ms_list) if total_latency_ms_list else 0.0
-    med_lat = np.median(total_latency_ms_list) if total_latency_ms_list else 0.0
+    # 2. 统计计算
+    tot_arr = np.array(total_latency_ms_list) if total_latency_ms_list else np.array([0.0])
+    s1_arr = np.array(s1_latency_ms_list) if s1_latency_ms_list else np.array([0.0])
+    s2_arr = np.array(s2_latency_ms_list) if s2_latency_ms_list else np.array([0.0])
 
+    avg_tot = float(np.mean(tot_arr))
+    p50_tot = float(np.percentile(tot_arr, 50))
+    p90_tot = float(np.percentile(tot_arr, 90))
+    p99_tot = float(np.percentile(tot_arr, 99))
+    std_tot = float(np.std(tot_arr))
+    single_frame_lat = avg_tot / 4.0
+
+    avg_s1 = float(np.mean(s1_arr))
+    p50_s1 = float(np.percentile(s1_arr, 50))
+    p99_s1 = float(np.percentile(s1_arr, 99))
+
+    avg_s2 = float(np.mean(s2_arr)) if len(s2_latency_ms_list) > 0 else 0.0
+    p50_s2 = float(np.percentile(s2_arr, 50)) if len(s2_latency_ms_list) > 0 else 0.0
+    p99_s2 = float(np.percentile(s2_arr, 99)) if len(s2_latency_ms_list) > 0 else 0.0
+
+    total_eval_frames = window_count * 4
+    offline_fps = total_eval_frames / max(0.001, total_wall_time)
+    window_qps = window_count / max(0.001, total_wall_time)
+
+    peak_vram_mb = 0.0
+    if torch and torch.cuda.is_available():
+        peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+    # 3. 写入 Markdown 汇总报告 (包含系统评测指标看板)
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write(f"# 视频检测评估报告: `{video_name}.mp4`\n\n")
-        f.write(f"- **测试时间**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"- **检测逻辑**: `100% 对齐 rtsp_twostage_vlm.py 级联模式 (vLLM 加速)`\n")
-        f.write(f"- **视频总时长**: {int(video_duration_s//60):02d}:{int(video_duration_s%60):02d} ({video_duration_s:.1f}s)\n")
-        f.write(f"- **实际推理耗时**: {int(total_wall_time//60):02d}:{int(total_wall_time%60):02d} ({total_wall_time:.1f}s)\n")
-        f.write(f"- **处理窗口总数**: {window_count} 个\n")
-        f.write(f"- **平均单窗口耗时**: {avg_lat:.1f} ms (中位数: {med_lat:.1f} ms)\n")
+        f.write(f"# 动车组受电弓故障监测系统 - 离线视频基准评测报告\n\n")
+        f.write(f"- **测试视频文件**: `{video_path}`\n")
+        f.write(f"- **测试执行时间**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"- **视频总时长**: {int(video_duration_s//60):02d}:{int(video_duration_s%60):02d} ({video_duration_s:.1f}s), 总帧数: {total_frames}\n")
+        f.write(f"- **实际压测耗时**: {int(total_wall_time//60):02d}:{int(total_wall_time%60):02d} ({total_wall_time:.1f}s)\n")
+        f.write(f"- **处理窗口总数**: {window_count} 个 (等效评测帧数: {total_eval_frames} 帧)\n")
         f.write(f"- **检出故障事件总数**: {fault_event_count} 次\n\n")
-        f.write("## 故障检出明细表\n\n")
+
+        f.write("## 1. 核心系统评测指标汇总表 (System Benchmark Scorecard)\n\n")
+        f.write("| 评测维度 | 指标项 | 评测实测值 | 性能判定与说明 |\n")
+        f.write("| :--- | :--- | :--- | :--- |\n")
+        f.write(f"| **处理延迟** | **平均单窗口耗时 (Mean)** | **{avg_tot:.2f} ms** | 4 帧动静级联诊断整体平均时延 |\n")
+        f.write(f"| | **等效平均单帧耗时** | **{single_frame_lat:.2f} ms / 帧** | 均摊至每张输入图像的处理时延 |\n")
+        f.write(f"| | **中位数耗时 (P50)** | **{p50_tot:.2f} ms** | 50% 样本处于该时延以内 |\n")
+        f.write(f"| | **90分位耗时 (P90)** | **{p90_tot:.2f} ms** | 90% 样本处于该时延以内 |\n")
+        f.write(f"| | **99分位耗时 (P99)** | **{p99_tot:.2f} ms** | 长尾极限时延，衡量系统抗抖动能力 |\n")
+        f.write(f"| | **时延标准差 (Jitter Std)** | **{std_tot:.2f} ms** | 时延稳定性评估 |\n")
+        f.write(f"| | Stage 1 (时序分类) 平均耗时 | {avg_s1:.2f} ms (P99: {p99_s1:.2f} ms) | 4 帧视频输入诊断火花与脏污 |\n")
+        f.write(f"| | Stage 2 (细粒度定位) 平均耗时 | {avg_s2:.2f} ms (P99: {p99_s2:.2f} ms) | 触发异物高精定位时的单帧耗时 |\n")
+        f.write(f"| **吞吐能力** | **纯算力极限吞吐率 (FPS)** | **{offline_fps:.2f} FPS** | 离线满载无间隔连续推帧处理速率 |\n")
+        f.write(f"| | **窗口吞吐率 (QPS)** | **{window_qps:.2f} Windows/s** | 每秒可完整完成的时序窗口诊断数 |\n")
+        f.write(f"| **资源开销** | **主机物理内存峰值 (RAM RSS)** | **{peak_ram_mb:.2f} MB ({peak_ram_mb/1024:.2f} GB)** | 进程常驻物理内存峰值 |\n")
+        if peak_vram_mb > 0:
+            f.write(f"| | **GPU 显存活跃峰值 (VRAM Alloc)** | **{peak_vram_mb:.2f} MB ({peak_vram_mb/1024:.2f} GB)** | PyTorch / CUDA 实际张量分配峰值 |\n")
+        f.write("\n---\n\n")
+
+        f.write("## 2. 故障事件检出明细表\n\n")
         f.write("| 窗口 # | 时间轴 | 耗时 | 总体结论 | 定位坐标 | 推理原因 | 事件截图 |\n")
         f.write("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
         for r in records:
@@ -230,16 +302,31 @@ def run_full_test(video_path, max_duration=None, output_dir="./test_results"):
 
     print("-" * 95)
     print("\n" + "=" * 95)
-    print(" 🏁 完整视频测试统计与落盘汇总")
+    print(" 🏁 完整视频评测统计与指标看板 (System Evaluation Scorecard)")
     print("=" * 95)
     print(f"• 测试视频: {video_path}")
-    print(f"• 视频总时长: {int(video_duration_s//60):02d}:{int(video_duration_s%60):02d} | 实际评测耗时: {int(total_wall_time//60):02d}:{int(total_wall_time%60):02d}")
-    print(f"• 评估窗口总数: {window_count} 个")
-    print(f"• 平均单窗口耗时: {avg_lat:.1f} ms (中位数: {med_lat:.1f} ms)")
-    print(f"• 检出故障事件总数: {fault_event_count} 次")
-    print("-" * 95)
-    print(f"📄 CSV 详细数据已保存至: {csv_path}")
-    print(f"📝 Markdown 报告已保存至: {md_path}")
+    print(f"• 评估窗口数: {window_count} 个 (等效帧数: {total_eval_frames}) | 实际用时: {total_wall_time:.2f}s")
+    print(f"-------------------------------------------------------------------------------------------")
+    print(f" [1] 处理延迟指标 (Latency)")
+    print(f"     - 平均单窗口处理耗时 (Mean) : {avg_tot:.2f} ms")
+    print(f"     - 等效单帧处理耗时 (Per-frame): {single_frame_lat:.2f} ms / 帧")
+    print(f"     - 中位数 (P50) / 90分位 (P90): {p50_tot:.2f} ms / {p90_tot:.2f} ms")
+    print(f"     - 99分位长尾时延 (P99)      : {p99_tot:.2f} ms (标准差: {std_tot:.2f} ms)")
+    print(f"     - Stage 1 (时序分类) 耗时   : 均值 {avg_s1:.1f} ms | P99 {p99_s1:.1f} ms")
+    print(f"     - Stage 2 (细粒度定位) 耗时 : 均值 {avg_s2:.1f} ms | P99 {p99_s2:.1f} ms")
+    print(f"-------------------------------------------------------------------------------------------")
+    print(f" [2] 吞吐能力指标 (Throughput)")
+    print(f"     - 纯算力离线极限吞吐 (FPS)  : {offline_fps:.2f} FPS")
+    print(f"     - 时序窗口诊断能力 (QPS)    : {window_qps:.2f} Windows/s")
+    print(f"-------------------------------------------------------------------------------------------")
+    print(f" [3] 内存与显存占用 (Resources)")
+    print(f"     - 主机物理内存峰值 (RSS)   : {peak_ram_mb:.2f} MB ({peak_ram_mb/1024:.2f} GB)")
+    if peak_vram_mb > 0:
+        print(f"     - GPU 显存活跃峰值 (VRAM)   : {peak_vram_mb:.2f} MB ({peak_vram_mb/1024:.2f} GB)")
+    print(f"-------------------------------------------------------------------------------------------")
+    print(f"• 故障事件检出次数: {fault_event_count} 次")
+    print(f"📄 CSV 明细数据已保存至: {csv_path}")
+    print(f"📝 Markdown 评测报告已保存至: {md_path}")
     if fault_event_count > 0:
         print(f"📸 故障 4 帧全量截图目录: {snapshot_dir}")
     print("=" * 95)

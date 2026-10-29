@@ -437,6 +437,16 @@ class TwoStageVLLMEngine:
         cand = None
         expired_log = []
 
+        flags = []
+        if spk == 1:
+            flags.append("🔥 大火花")
+        if dirt == 1:
+            flags.append("🌫️ 画面脏污")
+        if obj == 1:
+            flags.append("🎯 悬挂异物")
+        status_str = " | ".join(flags) if flags else "✅ 正常"
+        total_latency_ms = s1_ms + s2_ms
+
         return {
             # 故障标志（ai_detector.py 直接读取）
             "spk": spk,
@@ -447,14 +457,20 @@ class TwoStageVLLMEngine:
             "flt": 0,
             # 坐标结果
             "box": box_coords,
+            "box_coords": box_coords,
             "point": point_coords,
+            "foreign_point": point_coords,
             "raw_point": raw_point,
-            # 推理文本与耗时（ai_detector.py 打印日志用）
+            # 推理文本与耗时（ai_detector.py 与 评测脚本 兼容）
             "reasoning": reasoning,
+            "status_str": status_str,
             "s1_text": s1_text,
             "s2_text": s2_text,
             "s1_ms": s1_ms,
             "s2_ms": s2_ms,
+            "stage1_latency_ms": s1_ms,
+            "stage2_latency_ms": s2_ms,
+            "total_latency_ms": total_latency_ms,
             # 时序追踪器状态（ai_detector.py 读取 temporal_cand.hit_count）
             "temporal_status": status,
             "temporal_cand": cand,
